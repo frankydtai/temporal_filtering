@@ -4,6 +4,7 @@ Created on Wed Jul 26 09:53:25 2023
 
 @author: aborst
 """
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 import Medulla_Library as ml
@@ -63,7 +64,8 @@ Ih_gmax       = +50.0
 
 Ih_gain       = 1.0   # if set to 0, it will block Ih
 
-signal_amp    = 40.0 # amplitude of current injection in photoreceptors, in pA.
+signal_amp     = 40.0 # stimulus current injected in photoreceptors, in pA.
+signal_baseline = 20.0 # pre-stimulus baseline current in photoreceptors, in pA.
 data_amp      = 20.0  # amplitude of impulse response of all cells
 
 # parameter and cost function definition
@@ -72,6 +74,121 @@ nofparams = 2 * nofcells + 8 # 8 params for Ih (5 x gmax + 3)
 
 low_gain = 0.1
 high_gain = 100.0
+
+# ---- second neuron model: adaptive temporal filter (flyvis-derived) ----
+# 'conductance' = Borst conductance-based + Ih (update_Vm)
+# 'adaptive'    = passive point neuron + low-pass adaptive temporal filter
+MODEL_TYPE = 'conductance'
+
+gate_lag = 1  # delay (in steps) of the stimulus used for the contrast gate
+GATE_PIVOT = 0.5  # fixed contrast-gate pivot (non-trainable); input is normalised to [0,1]
+STATE_CLAMP = 1.0e6  # bound on adaptive state vars to keep explicit Euler finite
+
+# --- parameter schema: SINGLE SOURCE OF TRUTH -------------------------------
+# nofparams, assign, bounds and guess are all derived from these lists.
+# To change the parameterisation (sizes, ranges, which cells), edit ONLY here.
+# Each segment is a dict:
+#   name  : parameter name (becomes a key in the assigned dict)
+#   count : number of per-unit values for this segment (the 'individual' width)
+#   kind  : how `count` raw values become a usable parameter:
+#           'full'   -> count==nofcells; one value per cell type, replicated to 5 cols (325,)
+#           'lamina' -> count==5; placed at L1-L5 (indices 8:13), other cells = 'fill' (325,)
+#           'scalar' -> count==1; a single global 0-dim value (e.g. Ih_midv)
+#           'output' -> count==nofcells; per-cell-type value applied to the (150,65) OUTPUT
+#                       (not the 325-cell state, e.g. out_scale). returned as (65,).
+#   lo,hi : training bounds (clamped each Adam step)
+#   init  : random-init mean;  jit: init uniform jitter (+/- jit/2)
+#   fill  : value for non-listed cells ('lamina' only)
+#   zero  : local indices set to 0 at init in 'individual' mode (e.g. Ih L3,L4)
+#   mode  : 'individual' (train all `count` values, default), 'shared' (train ONE value
+#           broadcast to all units), or 'fixed' (train NOTHING; held at 'fixed' or 'init').
+#   fixed : constant value used when mode=='fixed' (defaults to 'init').
+# `mode`/`fixed` are normally NOT set here; they are overridden per run from the
+# CLI / SLURM (see run.py --mode / --fix), so the schema stays the canonical default.
+LAMINA_SLICE = slice(8, 13)  # L1-L5 within the 65 cell types
+PARAM_MODES = ('individual', 'shared', 'fixed')
+
+ADAPTIVE_SCHEMA = [
+    {'name': 'inp_gain',   'count': nofcells, 'kind': 'full',   'lo': low_gain, 'hi': high_gain, 'init': 0.5,   'jit': 0.2,  'fill': 0.0},
+    {'name': 'out_gain',   'count': nofcells, 'kind': 'full',   'lo': low_gain, 'hi': high_gain, 'init': 0.5,   'jit': 0.2,  'fill': 0.0},
+    {'name': 'tau_m',      'count': nofcells, 'kind': 'full',   'lo': deltat,   'hi': 1000.0,    'init': 50.0,  'jit': 10.0, 'fill': 0.0},
+    {'name': 'bias',       'count': nofcells, 'kind': 'full',   'lo': -2.0,     'hi': 2.0,       'init': 0.0,   'jit': 0.1,  'fill': 0.0},
+    {'name': 'adapt_gain', 'count': 5,        'kind': 'lamina', 'lo': -2.0,     'hi': 2.0,       'init': 0.0,   'jit': 0.1,  'fill': 0.0},
+    {'name': 'tau_adapt',  'count': 5,        'kind': 'lamina', 'lo': deltat,   'hi': 2000.0,    'init': 100.0, 'jit': 20.0, 'fill': deltat},
+    {'name': 'out_scale',  'count': nofcells, 'kind': 'output', 'lo': 0.0,      'hi': 1.0e4,     'init': 1.0,   'jit': 0.0},
+]
+
+# conductance (Borst + Ih) model parameters, same single-source-of-truth contract.
+# Layout matches the historical z vector + a trailing per-cell out_scale (65, init 1).
+CONDUCTANCE_SCHEMA = [
+    {'name': 'inp_gain',  'count': nofcells, 'kind': 'full',   'lo': low_gain, 'hi': high_gain, 'init': 0.5,      'jit': 0.2,  'fill': 0.0},
+    {'name': 'out_gain',  'count': nofcells, 'kind': 'full',   'lo': low_gain, 'hi': high_gain, 'init': 0.5,      'jit': 0.2,  'fill': 0.0},
+    {'name': 'Ih_gmax',   'count': 5,        'kind': 'lamina', 'lo': 0.0,      'hi': 100.0,     'init': Ih_gmax,  'jit': 10.0, 'fill': 0.0, 'zero': [2, 3]},
+    {'name': 'Ih_midv',   'count': 1,        'kind': 'scalar', 'lo': -70.0,    'hi': -30.0,     'init': Ih_midv,  'jit': 5.0},
+    {'name': 'Ih_slope',  'count': 1,        'kind': 'scalar', 'lo': -0.40,    'hi': -0.20,     'init': Ih_slope, 'jit': 0.02},
+    {'name': 'tau_midv',  'count': 1,        'kind': 'scalar', 'lo': -70.0,    'hi': -40.0,     'init': tau_midv, 'jit': 5.0},
+    {'name': 'out_scale', 'count': nofcells, 'kind': 'output', 'lo': 0.0,      'hi': 1.0e4,     'init': 1.0,      'jit': 0.0},
+]
+
+
+def seg_mode(seg):
+    mode = seg.get('mode', 'individual')
+    if mode not in PARAM_MODES:
+        raise ValueError(f"{seg['name']}: bad mode {mode!r}, expected one of {PARAM_MODES}")
+    return mode
+
+
+def seg_ntrain(seg):
+    """Number of trainable values stored in z for this segment, given its mode."""
+    mode = seg_mode(seg)
+    if mode == 'fixed':
+        return 0
+    if mode == 'shared':
+        return 1
+    return seg['count']                       # individual
+
+
+def schema_segments(schema):
+    """Yield (segment, start, stop) slice ranges into z (widths depend on mode)."""
+    start = 0
+    for seg in schema:
+        stop = start + seg_ntrain(seg)
+        yield seg, start, stop
+        start = stop
+
+
+def schema_nparams(schema):
+    return sum(seg_ntrain(seg) for seg in schema)
+
+
+def apply_modes(schema, modes=None, fixes=None):
+    """Return a COPY of schema with per-parameter mode / fixed-value overrides.
+
+    modes: {name: 'individual'|'shared'|'fixed'};  fixes: {name: value} (implies fixed).
+    Keeps the original schema (the canonical default) untouched.
+    """
+    modes, fixes = modes or {}, fixes or {}
+    out = []
+    for seg in schema:
+        s = dict(seg)
+        if s['name'] in modes:
+            s['mode'] = modes[s['name']]
+        if s['name'] in fixes:
+            s['mode'] = 'fixed'
+            s['fixed'] = float(fixes[s['name']])
+        out.append(s)
+    return out
+
+
+def active_schema():
+    return ADAPTIVE_SCHEMA if MODEL_TYPE == 'adaptive' else CONDUCTANCE_SCHEMA
+
+
+def adaptive_segments():
+    return schema_segments(ADAPTIVE_SCHEMA)
+
+
+nofparams_adaptive = schema_nparams(ADAPTIVE_SCHEMA)
 
 # -------------------------------------------------------------------------
 # -------------- reading cell data and connectivity matrices --------------
@@ -94,7 +211,12 @@ def init_network():
     M_exc = torch.tensor(M_exc,dtype=torch.float64).to(device)
     M_inh = torch.tensor(M_inh,dtype=torch.float64).to(device)
     
+    # signed connectivity for the adaptive (current-based) neuron model
+    M_signed = exc_synweight * multi_colM
+    M_signed = torch.tensor(M_signed,dtype=torch.float64).to(device)
+    
     signal = torch.zeros((200,325), dtype=torch.float64).to(device)
+    signal[0:50,130:138,]   = signal_baseline
     signal[50:200,130:138,] = signal_amp
 
     mydata = ml.read_RecF_data()*data_amp
@@ -109,9 +231,9 @@ def init_network():
         
     power = torch.sum((data[50:200])**2)
     
-    return M_exc, M_inh, ctype, mc_cell_index, data, power, signal
+    return M_exc, M_inh, M_signed, ctype, mc_cell_index, data, power, signal
 
-M_exc, M_inh, ctype, mc_cell_index, data, power, signal = init_network()
+M_exc, M_inh, M_signed, ctype, mc_cell_index, data, power, signal = init_network()
         
 # ------- network calculations  -----------------------------------------------
 
@@ -145,95 +267,213 @@ def update_Vm(Vm,u,inp_gain,out_gain,Ih_gmax,Ih_midv,Ih_slope,tau_midv,signal):
     
     return Vm, u
 
-#@torch.compile
-def calc_cost(z,data):
+# ---------- adaptive temporal-filter neuron model (flyvis-derived) -----------
+
+def _reconstruct_raw(seg, z_slice, z):
+    """Build the length-`count` per-unit vector from the trainable z slice + mode.
+    individual: the slice itself; shared: the one value broadcast; fixed: a constant.
+    Gradients flow into the (1 or count) trainable entries; fixed has none."""
+    mode, count = seg_mode(seg), seg['count']
+    if mode == 'fixed':
+        const = float(seg.get('fixed', seg['init']))
+        return torch.full((count,), const, dtype=z.dtype, device=z.device)
+    if mode == 'shared':
+        return z_slice[0].repeat(count)
+    return z_slice                                              # individual
+
+
+def _expand_segment(seg, raw):
+    """Map a length-`count` per-unit vector to a usable parameter, per its 'kind'."""
+    kind = seg['kind']
+    if kind == 'full':
+        return calc_multi_col_params(raw).to(device)            # (325,) state param
+    if kind == 'lamina':
+        cell = torch.full((nofcells,), float(seg['fill']), dtype=raw.dtype, device=raw.device)
+        cell[LAMINA_SLICE] = raw
+        return calc_multi_col_params(cell).to(device)           # (325,) state param
+    if kind == 'scalar':
+        return raw[0]                                           # 0-dim global value
+    if kind == 'output':
+        return raw.to(device)                                  # (nofcells,) output gain
+    raise ValueError(f"unknown segment kind: {kind}")
+
+
+def assign_params(z, schema):
+    """Unpack z into a dict of parameter tensors, driven by the given schema + modes."""
+    p = {}
+    for seg, start, stop in schema_segments(schema):
+        p[seg['name']] = _expand_segment(seg, _reconstruct_raw(seg, z[start:stop], z))
+    return p
+
+
+def assign_params_adaptive(z):
+    """Adaptive params plus the fixed (non-trainable) contrast-gate pivot."""
+    p = assign_params(z, ADAPTIVE_SCHEMA)
+    p['gate_pivot'] = GATE_PIVOT
+    return p
+
+def update_state_adaptive(activity, v_sustained, v_transient, drive_lp, p, x_t, x_t_delayed):
     
-    cost = 0
+    # passive point neuron: tau_m * da/dt = -a + X, with X = bias + syn + x_t.
+    # an adaptive low-pass reference (drive_lp) gates a transient component so
+    # that activity = v_sustained + v_transient.
     
-    inp_gain = calc_multi_col_params(z[0:65]).to(device)
-    out_gain = calc_multi_col_params(z[65:130]).to(device)
+    bias  = p['bias']
+    tau   = torch.clamp(p['tau_m'], min=deltat)
+    tau_r = torch.clamp(p['tau_adapt'], min=deltat)
+    ratio = tau / tau_r
     
-    interim = torch.zeros(65, dtype=torch.float64).to(device)
-    interim[8:13] = z[130:135]
-    Ih_gmax = calc_multi_col_params(interim).to(device)
+    # presynaptic output gain (per source), postsynaptic input gain (per target)
+    syn     = p['inp_gain'] * torch.mv(M_signed, torch.relu(activity) * p['out_gain'])
+    X       = bias + syn + x_t
+    X_gate  = bias + syn + x_t_delayed
+    gate    = (X_gate - p['gate_pivot']) * p['adapt_gain']
+    gate_src = torch.where(gate >= 0, drive_lp, 1.0 - drive_lp)
     
-    Ih_midv  = z[135]
-    Ih_slope = z[136]
-    tau_midv = z[137]
+    drive_lp    = drive_lp    + deltat / tau_r * (-drive_lp + X)
+    v_sustained = v_sustained + deltat / tau   * (-v_sustained + (1.0 - gate * ratio) * X)
+    v_transient = v_transient + deltat / tau   * (-v_transient + (-gate * (1.0 - ratio) * gate_src))
     
+    # explicit Euler on this recurrent ReLU net can diverge for large gains;
+    # clamp persistent states so blow-ups stay finite (large cost) instead of NaN.
+    drive_lp    = torch.clamp(drive_lp,    -STATE_CLAMP, STATE_CLAMP)
+    v_sustained = torch.clamp(v_sustained, -STATE_CLAMP, STATE_CLAMP)
+    v_transient = torch.clamp(v_transient, -STATE_CLAMP, STATE_CLAMP)
+    activity    = v_sustained + v_transient
+    
+    return activity, v_sustained, v_transient, drive_lp
+
+def model_cost(model, data, out_scale=1.0):
+    # normalised MSE over the response window (t=50..199); out_scale is an optional
+    # global linear output gain (default 1.0 -> unscaled).
+    return torch.sum((out_scale * model - data[50:200])**2) / power * 100.0
+
+def _run_conductance(p, neuron_index=None, return_ref=False):
+    # forward pass -> low-pass filtered response for the chosen neurons, shape
+    # (150, n). neuron_index defaults to the center-column cost cells (mc_cell_index);
+    # plotting passes other columns. return_ref also yields the resting baseline.
+    inp_gain, out_gain, Ih_gmax = p['inp_gain'], p['out_gain'], p['Ih_gmax']
+    Ih_midv, Ih_slope, tau_midv = p['Ih_midv'], p['Ih_slope'], p['tau_midv']
+    if neuron_index is None:
+        neuron_index = mc_cell_index
+
     u  = torch.zeros(325, dtype=torch.float64).to(device)
-
     Vm = E_leak
-    
-    model = 0
-    
-    for t in range(1,50): 
-        
+    for t in range(1,50):
         Vm, u = update_Vm(Vm,u,inp_gain,out_gain,Ih_gmax,Ih_midv,Ih_slope,tau_midv,signal[t-1])
+    Vm_ref = 1.0*Vm[neuron_index]  # reference 0
+    model = 0; rows = []
+    for t in range(50,200):
+        Vm, u = update_Vm(Vm,u,inp_gain,out_gain,Ih_gmax,Ih_midv,Ih_slope,tau_midv,signal[t-1])
+        model = deltat/Ca_tau * (Vm[neuron_index] - Vm_ref - model) + model
+        rows.append(model)
+    out = torch.stack(rows)
+    if return_ref:
+        return out, Vm_ref
+    return out
 
-    Vm_t49 = 1.0*Vm[mc_cell_index] # take this Vm as reference 0
-        
-    for t in range(50,200): 
-        
-        Vm, u = update_Vm(Vm,u,inp_gain,out_gain,Ih_gmax,Ih_midv,Ih_slope,tau_midv,signal[t-1])
-        
-        model = deltat/Ca_tau * (Vm[mc_cell_index] - Vm_t49 - model) + model # low-pass filter
-        
-        cost = cost + torch.sum((model-data[t])**2)
-        
-    cost = cost/power*100.0
-        
-    return cost
+def simulate_conductance(z):
+    return _run_conductance(assign_params(z, CONDUCTANCE_SCHEMA))
+
+def _run_adaptive(p, inp_scalar=None, return_diag=False, neuron_index=None, return_ref=False):
+    # forward pass -> low-pass filtered response for the chosen neurons, shape
+    # (150, n). neuron_index defaults to the center-column cost cells (mc_cell_index);
+    # plotting passes other columns.
+    # inp_scalar: override per-cell inp_gain with a uniform value (parameter sweeps).
+    # return_diag: also return {max|activity|, clamp-hit %} for stability analysis.
+    # return_ref: also return the resting baseline the trace is measured against.
+    if 'gate_pivot' not in p:
+        p = {**p, 'gate_pivot': GATE_PIVOT}
+    if inp_scalar is not None:
+        p = {**p, 'inp_gain': torch.full_like(p['bias'], float(inp_scalar))}
+    if neuron_index is None:
+        neuron_index = mc_cell_index
+    bias = p['bias']
+    x_signal = signal / signal_amp  # normalise input to [0,1] so gate_pivot ~ 0.5 is meaningful
+
+    activity    = bias.clone()
+    v_sustained = bias.clone()
+    v_transient = torch.zeros_like(bias)
+    drive_lp    = bias.clone()
+
+    maxact = 0.0; hits = 0; tot = 0
+    act_ref = None; model = 0; rows = []
+    for t in range(1, 200):
+        x_t = x_signal[t-1]
+        x_d = x_signal[max(t-1-gate_lag, 0)]
+        activity, v_sustained, v_transient, drive_lp = update_state_adaptive(
+            activity, v_sustained, v_transient, drive_lp, p, x_t, x_d)
+        if return_diag:
+            maxact = max(maxact, float(activity.abs().max()))
+            hits += int((v_sustained.abs() >= STATE_CLAMP).sum() + (v_transient.abs() >= STATE_CLAMP).sum())
+            tot += 2 * v_sustained.numel()
+        if t == 49:
+            act_ref = 1.0*activity[neuron_index]  # reference 0
+        elif t >= 50:
+            model = deltat/Ca_tau * (activity[neuron_index] - act_ref - model) + model
+            rows.append(model)
+    model = torch.stack(rows)
+    if return_diag:
+        return model, {'maxact': maxact, 'clamp_pct': 100.0 * hits / tot}
+    if return_ref:
+        return model, act_ref
+    return model
+
+def simulate_adaptive(z, inp_scalar=None, return_diag=False):
+    return _run_adaptive(assign_params_adaptive(z), inp_scalar, return_diag)
+
+#@torch.compile
+def calc_cost(z, data, out_scale=1.0):
+    # out_scale (the arg) multiplies on top of any 'out_scale' parameter declared in
+    # the active schema, so legacy callers (arg) and schema-driven training both work.
+    schema = active_schema()
+    p = assign_params(z, schema)
+    if MODEL_TYPE == 'adaptive':
+        model = _run_adaptive({**p, 'gate_pivot': GATE_PIVOT})
+    else:
+        model = _run_conductance(p)
+    return model_cost(model, data, out_scale * p.get('out_scale', 1.0))
+
+def calc_cost_adaptive(z, data, out_scale=1.0):
+    return model_cost(simulate_adaptive(z), data, out_scale)
     
+def schema_bounds(schema):
+    zb = torch.zeros((schema_nparams(schema), 2), dtype=torch.float64)
+    for seg, start, stop in schema_segments(schema):
+        if stop > start:                       # skip fixed (0 trainable rows)
+            zb[start:stop] = torch.tensor([seg['lo'], seg['hi']], dtype=torch.float64)
+    return zb
+
+def schema_guess(schema):
+    z = np.zeros(schema_nparams(schema))
+    for seg, start, stop in schema_segments(schema):
+        n = stop - start
+        if n == 0:                             # fixed: nothing to initialise
+            continue
+        z[start:stop] = seg['init'] + (np.random.rand(n) - 0.5) * seg['jit']
+        if seg_mode(seg) == 'individual':      # 'zero' only meaningful per-unit
+            for j in seg.get('zero', []):      # e.g. Ih_gmax L3,L4 start at 0
+                z[start + j] = 0.0
+    return torch.tensor(z, dtype=torch.float64).to(device)
+
 def calc_z_bounds():
-    
-    z_bounds = torch.zeros((nofparams,2), dtype=torch.float64)
-    
-    # input and output gain ------------------
-    
-    for i in range(2*nofcells): 
-        
-        z_bounds[i] = torch.tensor([low_gain, high_gain], dtype=torch.float64)
-        
-    # Ih_gmax
-    
-    for i in range(5):
-    
-        z_bounds[130+i] = torch.tensor([0,100], dtype=torch.float64)
-    
-    # Ih_midv
-    
-    z_bounds[135] = torch.tensor([-70,-30], dtype=torch.float64)
-    
-    # Ih_slope
-    
-    z_bounds[136] = torch.tensor([-0.40,-0.20], dtype=torch.float64)
-    
-    # Ih_tau
-    
-    z_bounds[137] = torch.tensor([-70,-40], dtype=torch.float64)
-    
-    return z_bounds
+    return schema_bounds(CONDUCTANCE_SCHEMA)
 
 z_bounds = calc_z_bounds()
-    
-def guess_initial_params():
-    
-    z = np.zeros(nofparams)
-        
-    z[0:65]    = + 0.5    + (np.random.rand(65)-0.5)*0.2
-    z[65:130]  = + 0.5    + (np.random.rand(65)-0.5)*0.2
-    z[130:135] = Ih_gmax  + (np.random.rand(5)-0.5)*10.0    # L1,L2,L5
-    z[132:134] = 0.0                                        # L3,L4
-    z[135]     = Ih_midv  + (np.random.rand()-0.5)*5.0
-    z[136]     = Ih_slope + (np.random.rand()-0.5)*0.02
-    z[137]     = tau_midv + (np.random.rand()-0.5)*5.0
-    
-    z = torch.tensor(z, dtype=torch.float64).to(device)
-    
-    return z
 
-def gradient_network(data, z, lr=0.0001, cost_fn=None, n_steps=100, device="cpu", z_bounds=None):
+def calc_z_bounds_adaptive():
+    return schema_bounds(ADAPTIVE_SCHEMA)
+
+z_bounds_adaptive = calc_z_bounds_adaptive()
+
+def guess_initial_params_adaptive():
+    return schema_guess(ADAPTIVE_SCHEMA)
+
+def guess_initial_params():
+    return schema_guess(CONDUCTANCE_SCHEMA)
+
+def gradient_network(data, z, lr=0.0001, cost_fn=None, n_steps=100, device="cpu", z_bounds=None,
+                     cost_log=None):
     
     a = time.time()
 
@@ -263,6 +503,9 @@ def gradient_network(data, z, lr=0.0001, cost_fn=None, n_steps=100, device="cpu"
             best_cost = cost.item()
             best_z = z.clone().detach()
         
+        if cost_log is not None:
+            cost_log.append(cost.item())
+        
         cost.backward()
         optimizer.step()
 
@@ -291,11 +534,31 @@ def gradient_network(data, z, lr=0.0001, cost_fn=None, n_steps=100, device="cpu"
 
     return best_z
 
-def do_many_runs(nofruns,nofsteps,fname):
+def train_staged(z, data, cost_fn, z_bounds, lrs, nsteps, cost_log=None):
+    # run gradient_network once per learning-rate stage, chaining the best params.
+    for lr in lrs:
+        z = gradient_network(data, z, lr=lr, n_steps=nsteps, device=device,
+                             cost_fn=cost_fn, z_bounds=z_bounds, cost_log=cost_log)
+    return z
+
+def do_many_runs(nofruns,nofsteps,fname,lrs=(0.1, 0.01, 0.001),outdir='FiveCol_Parameter'):
     
-    dirname = 'FiveCol_Parameter/'
+    os.makedirs(outdir, exist_ok=True)
     
-    all_params = np.zeros((nofruns,nofparams))
+    # record the model type next to the params so plotting never has to guess it
+    with open(os.path.join(outdir, 'model_type.txt'), 'w') as f:
+        f.write(MODEL_TYPE)
+    
+    schema   = active_schema()
+    n_params = schema_nparams(schema)
+    guess_fn = lambda: schema_guess(schema)
+    bounds   = schema_bounds(schema)
+    
+    all_params = np.zeros((nofruns,n_params))
+    
+    costs_name = fname.replace('.npy', '') + '_costs.npy'
+    best_final_cost = np.inf
+    best_cost_history = None
     
     for i in range(nofruns):
         
@@ -303,41 +566,23 @@ def do_many_runs(nofruns,nofsteps,fname):
         print('round',i)
         print()
         
-        z = guess_initial_params()
+        z = guess_fn()
 
-        z_fit = gradient_network(
-            data,
-            z,
-            lr=0.1,
-            n_steps=nofsteps,
-            device=device,
-            cost_fn=calc_cost,
-            z_bounds = z_bounds
-        )
+        # record per-step cost across all lr stages (same as local_cpu_test)
+        cost_history = []
+
+        z_fit = train_staged(z, data, calc_cost, bounds, lrs, nofsteps, cost_log=cost_history)
         
-        z_fit = gradient_network(
-            data,
-            z_fit,
-            lr=0.01,
-            n_steps=nofsteps,
-            device=device,
-            cost_fn=calc_cost,
-            z_bounds = z_bounds
-        )
+        all_params[i] = z_fit.detach().cpu().numpy()
         
-        z_fit = gradient_network(
-            data,
-            z_fit,
-            lr=0.001,
-            n_steps=nofsteps,
-            device=device,
-            cost_fn=calc_cost,
-            z_bounds = z_bounds
-        )
-        
-        all_params[i] = z_fit.detach().numpy()
-        
-        np.save(dirname+fname,all_params)
+        np.save(os.path.join(outdir, fname), all_params)
+
+        # keep the per-step cost curve of the best run so far
+        final_cost = calc_cost(z_fit, data).item()
+        if final_cost < best_final_cost:
+            best_final_cost = final_cost
+            best_cost_history = np.array(cost_history)
+            np.save(os.path.join(outdir, costs_name), best_cost_history)
         
 def refine_many_runs(all_params,nofsteps,lr = 0.01):
     
@@ -367,14 +612,14 @@ def refine_many_runs(all_params,nofsteps,lr = 0.01):
             z_bounds = z_bounds
         )
         
-        ref_params[i] = z_fit.detach().numpy()
+        ref_params[i] = z_fit.detach().cpu().numpy()
         
         np.save(dirname+fname,ref_params)
         
 def save_numpy_parameters(z_fit,fname):
     
     dirname = 'FiveCol_Parameter/'
-    z = z_fit.detach().numpy()
+    z = z_fit.detach().cpu().numpy()
     np.save(dirname+fname,z)
     
     

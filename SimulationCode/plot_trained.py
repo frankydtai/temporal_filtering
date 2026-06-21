@@ -1,0 +1,417 @@
+#!/usr/bin/env python
+"""Simulation + plotting for the FiveCol medulla model.
+
+This module owns all the model-trace simulation and the plotting routines
+(cost curve, model-vs-data, all-cell-types). It can also be run as a script to
+visualise a trained parameter set in model_vs_data.png format:
+
+    python plot_trained.py [params.npy] [outdir] [model_type]
+
+Accepts either a single param vector (P,) or a stack (N, P); for a stack the
+lowest-cost set is selected. The model type is NOT guessed from the parameter
+count: it is recorded next to the params at save time (model_type.txt) and read
+back here, so it works for any parameter count. Resolution priority is
+explicit model_type arg > sidecar model_type.txt > run-dir path name.
+"""
+import os
+import sys
+import time
+
+os.environ['CUDA_VISIBLE_DEVICES'] = ''
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+
+import Medulla_Library as ml
+import blindschleiche_py3 as bs
+import FiveCol_MedSim_Pytorch as fc
+from FiveCol_MedSim_Pytorch import (
+    calc_cost,
+    data,
+    data_amp,
+    device,
+    mc_cell_index,
+    nofcells,
+)
+
+CELL_LIST = np.array(
+    ['L1', 'L2', 'L3', 'L4', 'L5', 'Mi1', 'Tm3', 'Mi4', 'Mi9', 'Tm1', 'Tm2', 'Tm4', 'Tm9']
+)
+CENTER_COL = 2  # center of the 5 columns used in the cost function
+CTYPE = np.load('Circuits/ctype.npy', allow_pickle=True)
+FIT_INDEX = {name: i for i, name in enumerate(CELL_LIST)}
+CENTER_NEURON_OFFSET = CENTER_COL * nofcells
+
+
+def run_dir(model_type, root='FiveCol_Parameter', parent=None):
+    """Fresh output folder for one run, shared by all drivers.
+
+    parent/run_<id>/ where parent defaults to <root>/<model_type>/ and <id> is
+    the SLURM job id (under SLURM) or a timestamp otherwise.
+    """
+    if parent is None:
+        parent = os.path.join(root, model_type)
+    job_id = os.environ.get('SLURM_JOB_ID')
+    name = f'run_{job_id}' if job_id else time.strftime('run_%Y%m%d_%H%M%S')
+    outdir = os.path.join(parent, name)
+    os.makedirs(outdir, exist_ok=True)
+    return outdir
+
+
+def _out_scale_vec(z, neuron_index, schema):
+    """out_scale to apply to a trace of the cells in neuron_index (cell-type order).
+    Returns 1.0 (absent), a 0-dim scalar (global), or an (n,1) per-cell tensor."""
+    os_ = fc.assign_params(z, schema).get('out_scale', None)
+    if os_ is None:
+        return 1.0
+    if os_.dim() == 0:
+        return os_
+    idx = (neuron_index % nofcells).to(os_.device)
+    return os_[idx].reshape(-1, 1)
+
+
+def _as_index(neuron_index, device):
+    if not torch.is_tensor(neuron_index):
+        return torch.tensor(neuron_index, dtype=torch.long, device=device)
+    return neuron_index.to(device)
+
+
+def _pack_filtered(stacked, z, neuron_index, schema):
+    """Repack the core forward's (150, n) center-window response into the plot's
+    (n, 200) trace: pre-stimulus zeroed, optional out_scale applied, then shifted
+    one step to match the data convention. All model dynamics live in the core
+    (fc._run_conductance / fc._run_adaptive); this is presentation-only reshaping."""
+    n = stacked.shape[1]
+    trace = torch.zeros(n, 200, dtype=torch.float64, device=stacked.device)
+    trace[:, 50:200] = stacked.transpose(0, 1)
+    trace = trace * _out_scale_vec(z, neuron_index, schema)
+    trace[:, 0:50] = 0
+    trace[:, 0:199] = trace[:, 1:200]
+    return trace
+
+
+@torch.no_grad()
+def _simulate_filtered_traces(z, neuron_index, return_ref=False):
+    neuron_index = _as_index(neuron_index, z.device)
+    p = fc.assign_params(z, fc.CONDUCTANCE_SCHEMA)
+    stacked, ref = fc._run_conductance(p, neuron_index=neuron_index, return_ref=True)
+    trace = _pack_filtered(stacked, z, neuron_index, fc.CONDUCTANCE_SCHEMA)
+    if return_ref:
+        return trace, ref
+    return trace
+
+
+@torch.no_grad()
+def _simulate_filtered_traces_adaptive(z, neuron_index, return_ref=False):
+    neuron_index = _as_index(neuron_index, z.device)
+    p = fc.assign_params_adaptive(z)
+    stacked, ref = fc._run_adaptive(p, neuron_index=neuron_index, return_ref=True)
+    trace = _pack_filtered(stacked, z, neuron_index, fc.ADAPTIVE_SCHEMA)
+    if return_ref:
+        return trace, ref
+    return trace
+
+
+def _simulate(z, neuron_index, model_type=None, return_ref=False):
+    if model_type is None:
+        model_type = fc.MODEL_TYPE
+    if model_type == 'adaptive':
+        return _simulate_filtered_traces_adaptive(z, neuron_index, return_ref=return_ref)
+    return _simulate_filtered_traces(z, neuron_index, return_ref=return_ref)
+
+
+def calc_model_trace(z, model_type=None):
+    return _simulate(z, mc_cell_index, model_type)
+
+
+def calc_center_column_trace(z, model_type=None):
+    center_index = torch.arange(
+        CENTER_NEURON_OFFSET,
+        CENTER_NEURON_OFFSET + nofcells,
+        dtype=torch.long,
+        device=z.device,
+    )
+    return _simulate(z, center_index, model_type)
+
+
+def calc_model_full_all(z, model_type=None, return_ref=False):
+    """All cell types across 5 columns -> (65, 9, 200) spatio-temporal cube.
+
+    With return_ref=True also returns the per-cell resting baseline (the value
+    each trace is measured relative to) as a (65, 9) array; NaN where no column
+    was simulated.
+    """
+    model_full = np.zeros((nofcells, 9, 200))
+    ref_full = np.full((nofcells, 9), np.nan)
+    for col in range(5):
+        col_index = torch.arange(col * nofcells, (col + 1) * nofcells, dtype=torch.long, device=z.device)
+        if return_ref:
+            trace, ref = _simulate(z, col_index, model_type, return_ref=True)
+            model_full[:, col + 2] = trace.cpu().numpy()
+            ref_full[:, col + 2] = ref.cpu().numpy()
+        else:
+            model_full[:, col + 2] = _simulate(z, col_index, model_type).cpu().numpy()
+    if return_ref:
+        return model_full, ref_full
+    return model_full
+
+
+def _scale_curve(xt, center):
+    """Impulse response (time) and amplitude-scaled azimuth RF for one cube."""
+    imp = xt[center]
+    maxt = int(np.argmax(np.abs(imp)))
+    rf = bs.blurr(bs.rebin(xt[:, maxt], 45), 5)
+    amp = float(np.max(np.abs(imp)))
+    rf = rf / (np.max(np.abs(rf)) + 1e-12) * amp
+    return imp, np.roll(rf, -2)
+
+
+def _nice_ylim(*curves, margin=1.25, step=5.0, floor=5.0, min_pad=3.0):
+    vals = [np.asarray(c).ravel() for c in curves if c is not None]
+    if not vals:
+        return -floor, floor
+    peak = float(np.max(np.abs(np.concatenate(vals))))
+    ymax = max(peak * margin, peak + min_pad, floor)
+    ymax = float(np.ceil(ymax / step) * step)
+    return -ymax, ymax
+
+
+def _style_time_axis(ax, show_xlabel):
+    ax.set_xlim(0, 200)
+    ax.set_xticks([0, 100, 200])
+    ax.set_xticklabels(['0', '1', '2'], fontsize=6)
+    if show_xlabel:
+        ax.set_xlabel('time [s]', fontsize=7)
+
+
+def _style_azimuth_axis(ax, show_xlabel):
+    ax.set_xlim(0, 40)
+    ax.set_xticks([0, 20, 40])
+    ax.set_xticklabels(['-20', '0', '20'], fontsize=6)
+    if show_xlabel:
+        ax.set_xlabel('azimuth [$^\\circ$]', fontsize=7)
+
+
+def _annotate_baseline(ax, baseline):
+    """Relabel the y=0 line with the actual resting value (the trace baseline)."""
+    if baseline is None or not np.isfinite(baseline):
+        return
+    ylo, yhi = ax.get_ylim()
+    ax.set_yticks([ylo, 0.0, yhi])
+    ax.set_yticklabels([f'{ylo:+.0f}', f'{baseline:.1f}', f'{yhi:+.0f}'], fontsize=6)
+    ax.axhline(0.0, color='0.4', linewidth=0.6, linestyle=':', zorder=0)
+
+
+def _plot_cell_pair_axes(ax_rf, ax_time, model_xt, ref_xt, title, show_legend=False,
+                         show_xlabels=False, show_ylabel=False, baseline=None):
+    """Match Borst_Fig4-6: azimuth RF on top, time response below."""
+    center = CENTER_COL + 2
+    imp_model, rf_model = _scale_curve(model_xt, center)
+    if ref_xt is not None:
+        imp_data, rf_data = _scale_curve(ref_xt, center)
+    else:
+        imp_data, rf_data = None, None
+    curves = [c for c in (imp_model, imp_data, rf_model, rf_data) if c is not None]
+    ylo, yhi = _nice_ylim(*curves)
+
+    ax_rf.plot(rf_data, color='gray', linewidth=1.5, label='data') if rf_data is not None else None
+    ax_rf.plot(rf_model, color='red', linewidth=1.5, label='model')
+    ax_rf.set_title(title, fontsize=8, pad=2)
+    ax_rf.set_ylim(ylo, yhi)
+    _style_azimuth_axis(ax_rf, show_xlabels)
+    if show_ylabel:
+        ax_rf.set_ylabel('mV', fontsize=7)
+    ax_rf.tick_params(labelsize=6)
+    _annotate_baseline(ax_rf, baseline)
+    if show_legend:
+        ax_rf.legend(loc='upper right', fontsize=6, frameon=False)
+
+    ax_time.plot(imp_data, color='gray', linewidth=1.5) if imp_data is not None else None
+    ax_time.plot(imp_model, color='red', linewidth=1.5)
+    ax_time.set_ylim(ylo, yhi)
+    _style_time_axis(ax_time, show_xlabels)
+    if show_ylabel:
+        ax_time.set_ylabel('mV', fontsize=7)
+    ax_time.tick_params(labelsize=6)
+    _annotate_baseline(ax_time, baseline)
+
+
+def plot_cost(costs, path):
+    plt.figure(figsize=(8, 4))
+    plt.plot(costs, color='steelblue', linewidth=2)
+    plt.xlabel('step')
+    plt.ylabel('cost [% data power]')
+    plt.title(f'Training cost ({len(costs)} steps)')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+
+
+def plot_model_vs_data(z, path, n_steps=None, title=None):
+    ref_data = ml.read_RecF_data() * data_amp
+    model_full, ref_full = calc_model_full_all(z, return_ref=True)
+
+    fig = plt.figure(figsize=(16, 10))
+    gs = fig.add_gridspec(4, 13, hspace=0.5, wspace=0.55,
+                          top=0.93, bottom=0.06, left=0.06, right=0.98)
+
+    layout = [
+        (CELL_LIST[0:5], 0, [4, 5, 6, 7, 8]),
+        (CELL_LIST[5:9], 2, [1, 2, 3, 4]),
+        (CELL_LIST[9:13], 2, [8, 9, 10, 11]),
+    ]
+    legend_done = False
+    for names, rf_row, cols in layout:
+        for i, (name, col) in enumerate(zip(names, cols)):
+            fit_i = int(np.where(CELL_LIST == name)[0][0])
+            ctype_i = int(np.where(CTYPE == name)[0][0])
+            ax_rf = fig.add_subplot(gs[rf_row, col])
+            ax_time = fig.add_subplot(gs[rf_row + 1, col])
+            _plot_cell_pair_axes(
+                ax_rf, ax_time, model_full[ctype_i], ref_data[fit_i], name,
+                show_legend=not legend_done,
+                show_xlabels=True,
+                show_ylabel=(name in ('L1', 'Mi1', 'Tm1')),
+                baseline=ref_full[ctype_i, CENTER_COL + 2],
+            )
+            legend_done = True
+
+    if title is None:
+        title = f'Model vs data after {n_steps} steps (center column)'
+    fig.suptitle(title, fontsize=12)
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def plot_all_celltypes(z, path, n_steps=None, title=None):
+    """All 65 cell types: azimuth RF top, time bottom (Borst_Fig4-6 layout)."""
+    ref_data = ml.read_RecF_data() * data_amp
+    model_full, ref_full = calc_model_full_all(z, return_ref=True)
+
+    ncols = 13
+    fig = plt.figure(figsize=(26, 32))
+    gs = fig.add_gridspec(10, ncols, hspace=0.65, wspace=0.45,
+                          top=0.97, bottom=0.03, left=0.04, right=0.99)
+
+    for i in range(nofcells):
+        row, col = divmod(i, ncols)
+        name = str(CTYPE[i])
+        ref_xt = ref_data[FIT_INDEX[name]] if name in FIT_INDEX else None
+        ax_rf = fig.add_subplot(gs[row * 2, col])
+        ax_time = fig.add_subplot(gs[row * 2 + 1, col])
+        _plot_cell_pair_axes(
+            ax_rf, ax_time, model_full[i], ref_xt, name,
+            show_legend=(i == 0),
+            show_xlabels=(row == 4),
+            show_ylabel=(col == 0),
+            baseline=ref_full[i, CENTER_COL + 2],
+        )
+
+    if title is None:
+        title = f'All {nofcells} cell types after {n_steps} steps'
+    fig.suptitle(title, fontsize=14)
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+MODEL_TYPE_FILE = 'model_type.txt'
+KNOWN_MODEL_TYPES = ('conductance', 'adaptive')
+
+
+def _model_type_from_sidecar(params_path):
+    """model_type recorded next to the params at save time (the source of truth)."""
+    side = os.path.join(os.path.dirname(os.path.abspath(params_path)), MODEL_TYPE_FILE)
+    if os.path.exists(side):
+        with open(side) as f:
+            return f.read().strip()
+    return None
+
+
+def _model_type_from_path(params_path):
+    """Fallback: the run dir is FiveCol_Parameter/<model_type>/run_<id>/..."""
+    parts = os.path.abspath(params_path).split(os.sep)
+    for mt in KNOWN_MODEL_TYPES:
+        if mt in parts:
+            return mt
+    return None
+
+
+def resolve_model_type(params_path, override=None):
+    """Determine the model type without ever guessing from parameter count.
+
+    Priority: explicit override > sidecar model_type.txt > run-dir path name.
+    The model is known when the params are produced, so it is recorded then and
+    simply read back here; this works for any parameter count.
+    """
+    model_type = (override
+                  or _model_type_from_sidecar(params_path)
+                  or _model_type_from_path(params_path))
+    if model_type not in KNOWN_MODEL_TYPES:
+        raise SystemExit(
+            'cannot determine model_type for '
+            f'{params_path!r}; pass it explicitly, e.g.\n'
+            '  python plot_trained.py params.npy outdir <conductance|adaptive>'
+        )
+    fc.MODEL_TYPE = model_type
+    return model_type
+
+
+def select_best(params):
+    params = np.atleast_2d(params)
+    # drop rows not yet filled by training (all zeros)
+    valid = params[np.any(params != 0, axis=1)]
+    if len(valid) == 0:
+        raise SystemExit('no trained parameter sets found (file all zeros)')
+    costs = []
+    for row in valid:
+        z = torch.tensor(row, dtype=torch.float64)
+        costs.append(calc_cost(z, data).item())
+    costs = np.array(costs)
+    best = int(np.argmin(costs))
+    print(f'{len(valid)} trained set(s); costs min={costs.min():.4f} '
+          f'max={costs.max():.4f}; selected #{best}')
+    return valid[best], costs[best]
+
+
+def plot_param_set(params, outdir, costs=None, model_type=None):
+    """Select the best param set and write all plots into outdir.
+
+    Shared by run.py (after training) and main() (standalone). The model type
+    must already be known: either set in fc.MODEL_TYPE by the caller, or passed
+    via model_type. It is never guessed from the parameter count.
+    """
+    os.makedirs(outdir, exist_ok=True)
+    if model_type is not None:
+        fc.MODEL_TYPE = model_type
+
+    best, best_cost = select_best(params)
+    z = torch.tensor(best, dtype=torch.float64, device=device)
+
+    if costs is not None:
+        plot_cost(costs, os.path.join(outdir, 'cost_curve.png'))
+
+    suffix = f'trained, cost {best_cost:.2f}% of data power'
+    mvd = os.path.join(outdir, 'model_vs_data.png')
+    allc = os.path.join(outdir, 'model_all_cells.png')
+    plot_model_vs_data(z, mvd, title=f'Model vs data ({suffix})')
+    plot_all_celltypes(z, allc, title=f'All 65 cell types ({suffix})')
+    np.save(os.path.join(outdir, 'best_param.npy'), best)
+    print(f'plots saved to {outdir}')
+    return best, best_cost
+
+
+def main():
+    params_path = sys.argv[1] if len(sys.argv) > 1 else 'FiveCol_Parameter/training_with_Ih.npy'
+    outdir = sys.argv[2] if len(sys.argv) > 2 else 'FiveCol_Parameter/gpu_test'
+    override = sys.argv[3] if len(sys.argv) > 3 else None
+
+    params = np.load(params_path)
+    model_type = resolve_model_type(params_path, override)
+    print(f'model_type={model_type} ({params.shape[-1]} params per set)')
+    plot_param_set(params, outdir, model_type=model_type)
+
+
+if __name__ == '__main__':
+    main()
