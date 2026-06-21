@@ -24,11 +24,15 @@ import os
 import sys
 import time
 
-# CLI `local` mode must disable CUDA *before* the model library is imported.
-# Only when executed as a script (never on `import run`, so importers keep full
-# control of CUDA_VISIBLE_DEVICES by setting it before importing).
-if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "local":
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+# When executed as a script, run from this file's own directory so `fc` finds
+# Circuits/ regardless of where it was launched (no need to cd first). Done
+# before importing fc (which loads Circuits/ at import time). NOT done on
+# `import run`, so importers keep control of cwd / CUDA_VISIBLE_DEVICES.
+if __name__ == "__main__":
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    # CLI `local` mode must disable CUDA *before* the model library is imported.
+    if len(sys.argv) > 1 and sys.argv[1] == "local":
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import numpy as np
 import torch

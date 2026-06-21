@@ -43,6 +43,47 @@ CTYPE = np.load('Circuits/ctype.npy', allow_pickle=True)
 FIT_INDEX = {name: i for i, name in enumerate(CELL_LIST)}
 CENTER_NEURON_OFFSET = CENTER_COL * nofcells
 
+# --- generic, test-driven plotting hooks (this module hardcodes no cell beyond
+#     the default fit cells) --------------------------------------------------
+# REF_CUBES: name -> (9,200) grey "data" reference cube drawn behind the model.
+#   Defaults to the measured RF data for the 13 fit cells. A test script may
+#   extend/override it (e.g. map R1-8 to L1's cube) so the plots follow whatever
+#   the experiment configured -- without editing this file.
+# MVD_GROUPS: ORDERED list of cell-name groups for model_vs_data. Each group is
+#   drawn as its own row-pair (RF row + time row), assigned top-to-bottom in
+#   order; EMPTY groups are skipped, so removing a group shifts the rest up (e.g.
+#   with no R group, L becomes the top row-pair). Columns within a group are
+#   auto-centred. None -> DEFAULT_MVD_GROUPS. A test may prepend/append groups
+#   (e.g. an R1-8 group on top) -- this module hardcodes no R cells.
+REF_CUBES = None
+MVD_GROUPS = None
+
+DEFAULT_MVD_GROUPS = [
+    np.array(['L1', 'L2', 'L3', 'L4', 'L5']),               # lamina
+    np.array(['Mi1', 'Mi4', 'Mi9']),                        # Mi
+    np.array(['Tm1', 'Tm2', 'Tm3', 'Tm4', 'Tm9']),          # Tm
+]
+
+
+def default_ref_cubes():
+    """Grey reference cube per fit-cell name, from the measured RF data."""
+    ref = ml.read_RecF_data() * data_amp                 # (13, 9, 200)
+    return {name: ref[i] for i, name in enumerate(CELL_LIST)}
+
+
+def reference_cube(name):
+    """(9,200) grey reference for a cell name, or None if none is registered."""
+    global REF_CUBES
+    if REF_CUBES is None:
+        REF_CUBES = default_ref_cubes()
+    return REF_CUBES.get(str(name))
+
+
+def mvd_groups():
+    """Present (non-empty) groups for model_vs_data, in display order."""
+    groups = MVD_GROUPS if MVD_GROUPS is not None else DEFAULT_MVD_GROUPS
+    return [np.asarray(g) for g in groups if len(g) > 0]
+
 
 def run_dir(model_type, root='FiveCol_Parameter', parent=None):
     """Fresh output folder for one run, shared by all drivers.
@@ -250,30 +291,29 @@ def plot_cost(costs, path):
 
 
 def plot_model_vs_data(z, path, n_steps=None, title=None):
-    ref_data = ml.read_RecF_data() * data_amp
     model_full, ref_full = calc_model_full_all(z, return_ref=True)
 
-    fig = plt.figure(figsize=(16, 10))
-    gs = fig.add_gridspec(4, 13, hspace=0.5, wspace=0.55,
-                          top=0.93, bottom=0.06, left=0.06, right=0.98)
+    groups = mvd_groups()
+    ncols = 13
+    nrows = 2 * len(groups)
+    fig = plt.figure(figsize=(16, 2.5 * nrows))
+    gs = fig.add_gridspec(nrows, ncols, hspace=0.5, wspace=0.55,
+                          top=0.95, bottom=0.05, left=0.06, right=0.98)
 
-    layout = [
-        (CELL_LIST[0:5], 0, [4, 5, 6, 7, 8]),
-        (CELL_LIST[5:9], 2, [1, 2, 3, 4]),
-        (CELL_LIST[9:13], 2, [8, 9, 10, 11]),
-    ]
     legend_done = False
-    for names, rf_row, cols in layout:
-        for i, (name, col) in enumerate(zip(names, cols)):
-            fit_i = int(np.where(CELL_LIST == name)[0][0])
+    for gi, names in enumerate(groups):
+        rf_row = 2 * gi                              # each group gets its own row-pair
+        start = (ncols - len(names)) // 2            # auto-centre columns
+        for j, name in enumerate(names):
+            col = start + j
             ctype_i = int(np.where(CTYPE == name)[0][0])
             ax_rf = fig.add_subplot(gs[rf_row, col])
             ax_time = fig.add_subplot(gs[rf_row + 1, col])
             _plot_cell_pair_axes(
-                ax_rf, ax_time, model_full[ctype_i], ref_data[fit_i], name,
+                ax_rf, ax_time, model_full[ctype_i], reference_cube(name), name,
                 show_legend=not legend_done,
                 show_xlabels=True,
-                show_ylabel=(name in ('L1', 'Mi1', 'Tm1')),
+                show_ylabel=(j == 0),                # leftmost cell of each group
                 baseline=ref_full[ctype_i, CENTER_COL + 2],
             )
             legend_done = True
@@ -287,7 +327,6 @@ def plot_model_vs_data(z, path, n_steps=None, title=None):
 
 def plot_all_celltypes(z, path, n_steps=None, title=None):
     """All 65 cell types: azimuth RF top, time bottom (Borst_Fig4-6 layout)."""
-    ref_data = ml.read_RecF_data() * data_amp
     model_full, ref_full = calc_model_full_all(z, return_ref=True)
 
     ncols = 13
@@ -298,7 +337,7 @@ def plot_all_celltypes(z, path, n_steps=None, title=None):
     for i in range(nofcells):
         row, col = divmod(i, ncols)
         name = str(CTYPE[i])
-        ref_xt = ref_data[FIT_INDEX[name]] if name in FIT_INDEX else None
+        ref_xt = reference_cube(name)
         ax_rf = fig.add_subplot(gs[row * 2, col])
         ax_time = fig.add_subplot(gs[row * 2 + 1, col])
         _plot_cell_pair_axes(
@@ -367,7 +406,7 @@ def select_best(params):
     costs = []
     for row in valid:
         z = torch.tensor(row, dtype=torch.float64)
-        costs.append(calc_cost(z, data).item())
+        costs.append(fc.calc_cost(z, fc.data).item())
     costs = np.array(costs)
     best = int(np.argmin(costs))
     print(f'{len(valid)} trained set(s); costs min={costs.min():.4f} '

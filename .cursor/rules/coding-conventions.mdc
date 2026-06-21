@@ -5,40 +5,45 @@ alwaysApply: true
 
 # Coding Conventions (temporal_filtering)
 
-## 1. Schema is the single source of truth
+## 1. Always run Python via .venv
+- ALWAYS execute Python through the project virtual environment at
+  `.venv` (e.g. `.venv/bin/python <script>`). Never call bare `python` /
+  `python3`. The required packages (numpy, torch, matplotlib, ...) live ONLY
+  in `.venv`.
+
+## 2. Schema is the single source of truth
 - Model parameters MUST be defined in a schema (`ADAPTIVE_SCHEMA`, `CONDUCTANCE_SCHEMA`).
   `assign / bounds / guess / nparams / tables` all derive from the schema.
 - NO scattered hardcoded indices (`z[130:135]`, `z[135]`). Changing a parameter
   happens in ONE place: the schema.
 
-## 2. Core must be flexible for new parameters
+## 3. Core must be flexible for new parameters
 - Core (`fc`) must accept new params (e.g. `out_scale`, 1 global or 65 per-cell) by
   adding ONE schema segment — without editing `calc_cost` / `do_many_runs` / table logic.
 
-## 3. Reuse, never re-implement
+## 4. Reuse, never re-implement
 - Test/experiment scripts MUST `import run` / `import fc` and reuse existing functions.
 - NEVER re-implement the model forward / trainer / cost in a test.
 - NEVER duplicate an existing function (e.g. don't wrap your own `out_dir` over `run.run_dir`).
 
-## 4. Tests follow the run.py pipeline EXACTLY
+## 5. Tests follow the run.py pipeline EXACTLY
 - Every trained variant calls `run.run_training(...)` and gets its OWN `run_<id>` folder.
 - Each folder must contain the FULL run.py output set: `*.npy`, `_costs.npy`,
   `_table.csv`, `cost_curve.png`, `model_vs_data.png`, `model_all_cells.png`,
   `best_param.npy`, `model_type.txt`. Never save only a subset.
 - Use run.py's naming. Do NOT invent names (no `results.txt`, no `*_outscale_table.csv`).
 
-## 5. run.py stays minimal
+## 6. run.py stays minimal
 - `run.py` holds only verified, general functions. Do NOT add test-only code to it.
 
-## 6. Clean output dir
+## 7. Clean output dir
 - Output dir contains ONLY `adaptive/` and `conductance/` — no `test/` subdir.
-- No junk files (`runs_summary.csv`, `globals.csv` are banned).
 - CSVs must be strictly rectangular (uniform columns, no comment/blank/ragged lines);
   fold global scalars into the table as constant columns.
 
-## 7. Claims need experimental evidence
+## 8. Claims need experimental evidence
 - Do not assert behavior (e.g. "scale makes it stable") without an experiment + data.
   Never conclude from a single loss number.
 
-## 8. Naming
+## 9. Naming
 - Use clear, meaningful names. No vague/ad-hoc names.

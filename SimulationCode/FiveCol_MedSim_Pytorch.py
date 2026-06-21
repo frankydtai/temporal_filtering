@@ -43,13 +43,24 @@ cdt       = capac/deltat
 
 Ca_tau    = 50.0  # in msec
 
-E_leak = torch.zeros(nofcells * nofcols, dtype=torch.float64).to(device) - 50.0
+# Resting potential. Most cells rest at E_LEAK_REST; a configurable set of
+# cell-types (default lamina L1-L3) is depolarised to E_LEAK_DEPOL. The depol
+# cell list is a module global so experiments can extend it (e.g. give R1-8 the
+# same depolarised baseline) WITHOUT editing the core: just append indices and
+# call build_e_leak() again. No cell type is hardcoded into the construction.
+E_LEAK_REST = -50.0
+E_LEAK_DEPOL = -20.0
+E_LEAK_DEPOL_CELLS = [8, 9, 10]  # L1-L3 cell-type indices within the 65 types
 
-for i in range(nofcols):
-    
-    # Lamina cells L1-L3 get E_leak of - 20.0 mV
-    
-    E_leak[nofcells*i+8:nofcells*i+11]  = -20.0
+def build_e_leak():
+    """(nofcells*nofcols,) resting potential, replicating the depol set per column."""
+    el = torch.zeros(nofcells * nofcols, dtype=torch.float64).to(device) + E_LEAK_REST
+    for col in range(nofcols):
+        for c in E_LEAK_DEPOL_CELLS:
+            el[nofcells * col + c] = E_LEAK_DEPOL
+    return el
+
+E_leak = build_e_leak()
 
 exc_synweight = 0.001
 inh_synweight = 0.001
@@ -63,6 +74,25 @@ tau_midv      = -50.0
 Ih_gmax       = +50.0 
 
 Ih_gain       = 1.0   # if set to 0, it will block Ih
+
+# Per-cell Ih direction: +1 = standard hyperpolarisation-activated Ih; -1 = Ih
+# REVERSED (activation flips to depolarisation-activated AND the reversal flips
+# sign about 0, E_Ih=+50 -> -50 mV), giving a gentle downward sag on an upward
+# response. Configurable like E_leak: a module global the experiment extends
+# (e.g. for photoreceptors); the core hardcodes no cell type. Built after
+# nofcells/nofcols/device exist (see build_ih_dir below).
+IH_DIR_REVERSE_CELLS = []   # cell-type indices whose Ih is mirrored
+
+def build_ih_dir():
+    """(nofcells*nofcols,) Ih direction (+1 normal, -1 mirrored), replicated per
+    column. Driven by IH_DIR_REVERSE_CELLS (cell-type indices); default all +1."""
+    d = torch.ones(nofcells * nofcols, dtype=torch.float64).to(device)
+    for col in range(nofcols):
+        for c in IH_DIR_REVERSE_CELLS:
+            d[nofcells * col + c] = -1.0
+    return d
+
+Ih_dir = build_ih_dir()
 
 signal_amp     = 40.0 # stimulus current injected in photoreceptors, in pA.
 signal_baseline = 20.0 # pre-stimulus baseline current in photoreceptors, in pA.
@@ -92,7 +122,9 @@ STATE_CLAMP = 1.0e6  # bound on adaptive state vars to keep explicit Euler finit
 #   count : number of per-unit values for this segment (the 'individual' width)
 #   kind  : how `count` raw values become a usable parameter:
 #           'full'   -> count==nofcells; one value per cell type, replicated to 5 cols (325,)
-#           'lamina' -> count==5; placed at L1-L5 (indices 8:13), other cells = 'fill' (325,)
+#           'lamina' -> one value per entry in seg['cells'] (default L1-L5, indices
+#                       8:13); an entry may be a list of indices that SHARE one value;
+#                       other cells = 'fill'. (325,). 'count' is ignored for this kind.
 #           'scalar' -> count==1; a single global 0-dim value (e.g. Ih_midv)
 #           'output' -> count==nofcells; per-cell-type value applied to the (150,65) OUTPUT
 #                       (not the 325-cell state, e.g. out_scale). returned as (65,).
@@ -138,6 +170,26 @@ def seg_mode(seg):
     return mode
 
 
+def lamina_cells(seg):
+    """Target cell-type indices for a 'lamina' segment, one entry per trainable value.
+
+    Each entry is either an int (one cell) or a list of ints (a GROUP of cells
+    that SHARE that single trainable value). Defaults to L1-L5 (LAMINA_SLICE) as
+    five independent values, reproducing the historical behaviour. Experiments
+    override seg['cells'] to remap/group/extend the lamina parameter (e.g. tie
+    R1-6 to one value while keeping R7, R8, L1-L5 independent) WITHOUT editing
+    the core: the placement and the value count both derive from this list."""
+    return seg.get('cells', list(range(LAMINA_SLICE.start, LAMINA_SLICE.stop)))
+
+
+def seg_count(seg):
+    """Number of per-unit values for a segment (its 'individual' width).
+    For 'lamina' this is the number of (possibly grouped) target entries."""
+    if seg['kind'] == 'lamina':
+        return len(lamina_cells(seg))
+    return seg['count']
+
+
 def seg_ntrain(seg):
     """Number of trainable values stored in z for this segment, given its mode."""
     mode = seg_mode(seg)
@@ -145,7 +197,7 @@ def seg_ntrain(seg):
         return 0
     if mode == 'shared':
         return 1
-    return seg['count']                       # individual
+    return seg_count(seg)                      # individual
 
 
 def schema_segments(schema):
@@ -254,7 +306,12 @@ def rectsyn(x,thrld):
 
 def update_Vm(Vm,u,inp_gain,out_gain,Ih_gmax,Ih_midv,Ih_slope,tau_midv,signal):
 
-    Ih_ss   = 1.0/(1.0+torch.exp((Ih_midv-Vm)*Ih_slope))
+    # Per-cell Ih direction reverses the current where Ih_dir==-1: the activation
+    # slope flips (depolarisation-activated) AND the reversal flips sign about 0
+    # (E_Ih=+50 -> -50 mV), a gentle pull-down toward rest. Ih_dir==+1 -> unchanged.
+    slope_eff = Ih_dir * Ih_slope
+    E_Ih_eff  = Ih_dir * E_Ih
+    Ih_ss   = 1.0/(1.0+torch.exp((Ih_midv-Vm)*slope_eff))
     tau     = 1.5/(torch.exp(-0.1*(Vm-tau_midv))+torch.exp(+0.1*(Vm-tau_midv)))*1000.0 + 100.0
     u       = deltat/tau*(Ih_ss-u)+u
     g_Ih    = u * Ih_gmax * Ih_gain
@@ -262,7 +319,7 @@ def update_Vm(Vm,u,inp_gain,out_gain,Ih_gmax,Ih_midv,Ih_slope,tau_midv,signal):
     g_exc   = torch.mv(M_exc,(rectsyn(Vm,trld)*out_gain))*inp_gain
     g_inh   = torch.mv(M_inh,(rectsyn(Vm,trld)*out_gain))*inp_gain
     
-    Vm = (g_exc*E_exc + g_inh*E_inh + g_leak*E_leak + E_Ih * g_Ih + cdt*Vm + signal)
+    Vm = (g_exc*E_exc + g_inh*E_inh + g_leak*E_leak + E_Ih_eff * g_Ih + cdt*Vm + signal)
     Vm = Vm / (g_exc + g_inh + g_Ih + g_leak + cdt)
     
     return Vm, u
@@ -273,7 +330,7 @@ def _reconstruct_raw(seg, z_slice, z):
     """Build the length-`count` per-unit vector from the trainable z slice + mode.
     individual: the slice itself; shared: the one value broadcast; fixed: a constant.
     Gradients flow into the (1 or count) trainable entries; fixed has none."""
-    mode, count = seg_mode(seg), seg['count']
+    mode, count = seg_mode(seg), seg_count(seg)
     if mode == 'fixed':
         const = float(seg.get('fixed', seg['init']))
         return torch.full((count,), const, dtype=z.dtype, device=z.device)
@@ -289,7 +346,8 @@ def _expand_segment(seg, raw):
         return calc_multi_col_params(raw).to(device)            # (325,) state param
     if kind == 'lamina':
         cell = torch.full((nofcells,), float(seg['fill']), dtype=raw.dtype, device=raw.device)
-        cell[LAMINA_SLICE] = raw
+        for i, target in enumerate(lamina_cells(seg)):          # int or list-of-ints (shared group)
+            cell[target] = raw[i]
         return calc_multi_col_params(cell).to(device)           # (325,) state param
     if kind == 'scalar':
         return raw[0]                                           # 0-dim global value
@@ -432,7 +490,15 @@ def calc_cost(z, data, out_scale=1.0):
         model = _run_adaptive({**p, 'gate_pivot': GATE_PIVOT})
     else:
         model = _run_conductance(p)
-    return model_cost(model, data, out_scale * p.get('out_scale', 1.0))
+    # out_scale is declared per cell-TYPE (nofcells,), but model columns are the
+    # COST CELLS (mc_cell_index, here = the default neuron set used by _run_*).
+    # Map each cost cell to its cell type so out_scale aligns no matter how many
+    # cost cells there are (lets experiments add cost cells, e.g. R1-8).
+    os_param = p.get('out_scale', 1.0)
+    if torch.is_tensor(os_param) and os_param.dim() > 0:
+        ci = torch.as_tensor(mc_cell_index, device=os_param.device, dtype=torch.long) % nofcells
+        os_param = os_param[ci]
+    return model_cost(model, data, out_scale * os_param)
 
 def calc_cost_adaptive(z, data, out_scale=1.0):
     return model_cost(simulate_adaptive(z), data, out_scale)
