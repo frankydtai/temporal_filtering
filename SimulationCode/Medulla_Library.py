@@ -147,10 +147,17 @@ def normalize_data(x):
         
     return result
 
-def read_RecF_data():
-    
+def read_RecF_ImpR():
+    """Return (RecF_data (13,45), ImpR_data (13,200)) for the 13 fit cell types.
+
+    Split out of read_RecF_data so callers that need the continuous spatial RF
+    (RecF_data) or the temporal kernel (ImpR_data) on their own -- e.g. the hex
+    radial target, which samples RecF at non-integer column distances (sqrt(3)) --
+    use the EXACT same construction the 5-column model uses (single source).
+    """
+
     # cell_list=np.array(['L1','L2','L3','L4','L5','Mi1','Tm3','Mi4','Mi9','Tm1','Tm2','Tm4','Tm9'])
-    
+
     RF_center_width  = np.array([6,7,6,8,7,6,12,6,6,8,8,11,7])
     RF_surrnd_width  = np.array([41,29,15,33,31,29,7,16,24,27,31,35,24])
     RF_surrnd_weight = np.array([0.012,0.013,0.19,0.046,0.035,0.022,0.000,0.132,0.063,0.040,0.035,0.054,0.046])*5.0
@@ -195,15 +202,23 @@ def read_RecF_data():
             ImpR_data[i] = ImpR_data[i] + 0.4 * signal 
             
         ImpR_data[i] = normalize_data(ImpR_data[i])
-        
-    # putting it all into a 13 (celltype) x 9 ((space) x 200 (time) array
-    
+
+    return RecF_data, ImpR_data
+
+
+def read_RecF_data():
+    # putting it all into a 13 (celltype) x 9 (space) x 200 (time) array.
+    # space index j maps to RF sample 5j+2 (j=4 -> sample 22 = RF centre, r=0);
+    # so column distance r maps to continuous RF sample 22 + 5r.
+
+    RecF_data, ImpR_data = read_RecF_ImpR()
+
     data = np.zeros((13,9,200))
-    
+
     for i in range(13):
         for j in range(9):
             data[i,j] = RecF_data[i,j*5+2]*ImpR_data[i]
-    
+
     return data
 
 def create_multi_ctype(ctype,n=9):

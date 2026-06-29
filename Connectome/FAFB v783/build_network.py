@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import pickle
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Set, Tuple
@@ -68,7 +69,8 @@ class VisualSystem:
     neurons: pd.DataFrame
     columns: pd.DataFrame
     connections: pd.DataFrame
-    type_counts_unfiltered: pd.Series
+    # Per-type table over the (pre-cut) side: type, count, family, subsystem, category.
+    type_table: pd.DataFrame
     metadata: Dict[str, object] = field(default_factory=dict)
 
     def save(self, output_dir: Optional[Path] = None) -> Path:
@@ -84,12 +86,13 @@ class VisualSystem:
         self.columns.to_csv(out / "columns.csv.gz", index=False, compression="gzip")
         self.connections.to_csv(out / "connections.csv.gz", index=False, compression="gzip")
 
-        kept_types = set(self.neurons["type"].unique())
-        type_counts = self.type_counts_unfiltered.rename_axis("type").reset_index(
-            name="neuron_count"
+        type_table = self.type_table
+        type_table.sort_values("count", ascending=False, kind="stable")[
+            ["type", "count"]
+        ].to_csv(out / "type_counts.csv", index=False)
+        type_table.sort_values("type", kind="stable").to_csv(
+            out / "type_counts_abc.csv", index=False
         )
-        type_counts["kept"] = type_counts["type"].isin(kept_types)
-        type_counts.to_csv(out / "type_counts.csv", index=False)
 
         with open(out / "metadata.json", "w") as fh:
             json.dump(self.metadata, fh, indent=2)
@@ -120,9 +123,22 @@ class FafbDataLoader:
         subsystems: Optional[Sequence[str]] = None,
         min_neuron_count: int = DEFAULT_MIN_NEURON_COUNT,
         min_syn_count: int = DEFAULT_MIN_SYN_COUNT,
+        use_cache: bool = True,
     ) -> VisualSystem:
         if side not in ("left", "right"):
             raise ValueError(f"side must be 'left' or 'right', got {side!r}")
+
+        # Cache the filtered subnetwork inside its run folder so the expensive
+        # raw-CSV streaming runs once. Only the default-subsystem path is cached.
+        cache_path: Optional[Path] = None
+        if subsystems is None:
+            cache_path = (
+                DATA_DIR / f"{side}_min_neuron{min_neuron_count}" / ".filter_cache"
+            )
+            if use_cache and cache_path.exists():
+                logger.info("Loading filtered visual system from cache %s", cache_path)
+                with open(cache_path, "rb") as fh:
+                    return pickle.load(fh)
 
         neurons = self.load_visual_neurons()
         neurons = neurons[neurons["side"] == side]
@@ -131,6 +147,10 @@ class FafbDataLoader:
         logger.info("After side=%s + subsystem filter: %d neurons", side, len(neurons))
 
         type_counts_unfiltered = neurons["type"].value_counts()
+        attr_cols = ["family", "subsystem", "category"]
+        type_table = neurons.groupby("type")[attr_cols].first()
+        type_table.insert(0, "count", type_counts_unfiltered)
+        type_table = type_table.rename_axis("type").reset_index()
         n_types_before = neurons["type"].nunique()
         if min_neuron_count > 0:
             keep_types = type_counts_unfiltered[
@@ -183,13 +203,19 @@ class FafbDataLoader:
             "n_columns": int(columns["column_id"].nunique()),
             "n_connections": len(connections),
         }
-        return VisualSystem(
+        vs = VisualSystem(
             neurons=neurons,
             columns=columns,
             connections=connections,
-            type_counts_unfiltered=type_counts_unfiltered,
+            type_table=type_table,
             metadata=metadata,
         )
+        if cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache_path, "wb") as fh:
+                pickle.dump(vs, fh)
+            logger.info("Cached filtered visual system to %s", cache_path)
+        return vs
 
 
 # =============================================================================
@@ -350,6 +376,74 @@ def build(side: str, min_neuron_count: int) -> Path:
     return out_path
 
 
+def crop_network(run_dir: Path, crop_extent: int, recenter: bool = True) -> Path:
+    """Crop a built network.json to the central hex disc of ``crop_extent``.
+
+    Keeps only column-positioned nodes whose hex distance from the centre is
+    ``<= crop_extent`` (and the edges between them), writing a sibling run folder
+    ``<run_dir.name>_extent<crop_extent>_col/network.json``. This is the small,
+    multi-column training input (extent=2 -> 19 columns).
+
+    Args:
+        run_dir: An existing run folder containing network.json.
+        crop_extent: Hex-disc radius to keep around the centre (2 -> 19 columns).
+        recenter: If True, re-index ``hex_index`` against a fresh
+            ``HexGrid(crop_extent)`` so indices run 0..N-1 for the small disc.
+    """
+    # Reuse the lattice math from hex_grid (single source of truth).
+    from hex_grid import HexGrid, hex_radius
+
+    src = _require(run_dir / "network.json")
+    payload = json.load(open(src))
+    nodes = payload["nodes"]
+    edges = payload["edges"]
+
+    kept_nodes = [
+        n for n in nodes
+        if n.get("u") is not None and hex_radius(n["u"], n["v"]) <= crop_extent
+    ]
+    kept_ids: Set[int] = {n["id"] for n in kept_nodes}
+    kept_edges = [
+        e for e in edges if e["src"] in kept_ids and e["tar"] in kept_ids
+    ]
+
+    if recenter:
+        grid = HexGrid(extent=crop_extent)
+        for n in kept_nodes:
+            n["hex_index"] = grid.uv_to_hex_index(n["u"], n["v"])
+
+    n_with_col = sum(1 for n in kept_nodes if n.get("u") is not None)
+    src_meta = payload.get("metadata", {})
+    metadata: Dict[str, object] = {
+        "side": src_meta.get("side"),
+        "min_neuron_count": src_meta.get("min_neuron_count"),
+        "extent": crop_extent,
+        "cropped_from": run_dir.name,
+        "source_extent": src_meta.get("extent"),
+        "sign_mode": src_meta.get("sign_mode"),
+        "nt_to_sign": src_meta.get("nt_to_sign"),
+        "forced_negative_pre_types": src_meta.get("forced_negative_pre_types"),
+        "n_nodes": len(kept_nodes),
+        "n_nodes_with_column": n_with_col,
+        "n_edges": len(kept_edges),
+        "n_input_nodes": int(sum(bool(n.get("input")) for n in kept_nodes)),
+        "n_cell_types": int(len({n["name"] for n in kept_nodes})),
+    }
+
+    out_dir = run_dir.parent / f"{run_dir.name}_extent{crop_extent}_col"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "network.json"
+    with open(out_path, "w") as fh:
+        json.dump({"metadata": metadata, "nodes": kept_nodes, "edges": kept_edges}, fh)
+    logger.info(
+        "Cropped %s -> %s (extent=%d): %d nodes, %d edges, %d types",
+        run_dir.name, out_path, crop_extent,
+        len(kept_nodes), len(kept_edges), metadata["n_cell_types"],
+    )
+    _write_summary(out_dir, metadata)
+    return out_path
+
+
 def _write_summary(run_dir: Path, meta: Dict[str, object]) -> Path:
     """Write a human-readable summary.txt of the node/edge/type stats."""
     # Filter-level stats (min_syn_count, columns, raw connections) from save().
@@ -404,6 +498,15 @@ def _parse_args() -> argparse.Namespace:
         "--skip-filter", action="store_true",
         help="Skip load+filter; build only from existing run folders.",
     )
+    parser.add_argument(
+        "--refresh-cache", action="store_true",
+        help="Ignore the filter cache and recompute from the raw CSVs.",
+    )
+    parser.add_argument(
+        "--crop-extent", type=int, default=None,
+        help="After building, crop network.json to the central hex disc of this "
+             "radius, writing <run>_extent<N>_col/ (e.g. 2 -> 19 columns).",
+    )
     return parser.parse_args()
 
 
@@ -419,6 +522,7 @@ def main() -> None:
                 side=side,
                 min_neuron_count=args.min_neuron_count,
                 min_syn_count=args.min_syn_count,
+                use_cache=not args.refresh_cache,
             )
             vs.save()
         out = build(side, args.min_neuron_count)
@@ -427,6 +531,14 @@ def main() -> None:
         for k, v in meta.items():
             print(f"  {k}: {v}")
         print(f"  output: {out}")
+
+        if args.crop_extent is not None:
+            crop_out = crop_network(out.parent, args.crop_extent)
+            crop_meta = json.load(open(crop_out))["metadata"]
+            print(f"\n=== crop (extent={args.crop_extent}) ===")
+            for k, v in crop_meta.items():
+                print(f"  {k}: {v}")
+            print(f"  output: {crop_out}")
 
 
 if __name__ == "__main__":

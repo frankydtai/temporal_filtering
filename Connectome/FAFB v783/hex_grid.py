@@ -84,6 +84,140 @@ def pq_to_uv(p, q, side: str) -> Tuple[np.ndarray, np.ndarray]:
     return -p, p - q
 
 
+# -- Pure lattice math: distance, rings, tiles, shifts ------------------------
+#
+# These are coordinate-only helpers (no FAFB data, no plotting). They are the
+# single source of truth for the hex math reused by the multi-column / tiling
+# pipeline (connectome_tiling.py, connectome_target.py, tile_extent2_hexagons.py).
+
+# The six unit step directions in axial (u, v), counter-clockwise.
+_HEX_DIRECTIONS = ((1, 0), (0, 1), (-1, 1), (-1, 0), (0, -1), (1, -1))
+
+
+def _rot60(u: int, v: int) -> Tuple[int, int]:
+    """Rotate an axial (u, v) offset 60 degrees counter-clockwise about origin."""
+    return -v, u + v
+
+
+def hex_radius(u: int, v: int) -> int:
+    """Hex-lattice distance from the origin to axial (u, v)."""
+    u, v = int(u), int(v)
+    return (abs(u) + abs(v) + abs(u + v)) // 2
+
+
+def ring_offsets(radius: int) -> list:
+    """Axial (u, v) offsets of the cells exactly ``radius`` steps from origin."""
+    if radius < 0:
+        raise ValueError(f"radius must be >= 0, got {radius}")
+    if radius == 0:
+        return [(0, 0)]
+    out = []
+    # Start ``radius`` steps along direction 4, then walk the six edges.
+    u, v = _HEX_DIRECTIONS[4][0] * radius, _HEX_DIRECTIONS[4][1] * radius
+    for d in range(6):
+        du, dv = _HEX_DIRECTIONS[d]
+        for _ in range(radius):
+            out.append((u, v))
+            u, v = u + du, v + dv
+    return out
+
+
+def tile_offsets(extent: int) -> list:
+    """Axial (u, v) offsets of every cell in a hex disc of the given radius."""
+    offs: list = []
+    for r in range(extent + 1):
+        offs.extend(ring_offsets(r))
+    return offs
+
+
+def shift_offsets() -> list:
+    """The 7 sub-tile shifts: the tile centre plus its 6 nearest neighbours."""
+    return tile_offsets(1)
+
+
+def tile_basis(
+    tile_extent: int, share_edges: bool = False
+) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    """Sublattice generators for a hex tiling by radius-``tile_extent`` hexes.
+
+    Two layouts (``k = tile_extent``):
+
+    - ``share_edges=False`` (default, disjoint): centres are spaced ``2k+1`` apart
+      on the gap-free perfect-tiling sublattice spanned by ``(2k+1, -k)`` and its
+      60-degree rotation. The squared norm equals the cell count, so tiles neither
+      overlap nor leave gaps (31 tiles for extent=15, tile_extent=2).
+    - ``share_edges=True`` (edge-sharing): centres are spaced ``2k`` apart along the
+      edge-perpendicular directions, ``(2k, -k)`` and its rotation. Each tile then
+      shares its boundary ring with its 6 neighbours, giving a denser, overlapping
+      cover (43 tiles for extent=15, tile_extent=2).
+    """
+    first = 2 * tile_extent if share_edges else 2 * tile_extent + 1
+    g1 = (first, -tile_extent)
+    g2 = _rot60(*g1)
+    return g1, g2
+
+
+def tile_centers(
+    extent: int = DEFAULT_EXTENT,
+    tile_extent: int = 2,
+    fully_inside: bool = True,
+    share_edges: bool = False,
+) -> list:
+    """Axial centres of the radius-``tile_extent`` hexes covering an ``extent`` disc.
+
+    Args:
+        extent: Radius of the disc to cover (the optic-lobe grid).
+        tile_extent: Radius of each tile (2 -> 19-cell extent-2 hexagons).
+        fully_inside: If True (default) keep only tiles whose every cell lies
+            inside the disc.
+        share_edges: If False (default) use the disjoint gap-free tiling (31 tiles
+            for extent=15, tile_extent=2); if True use the edge-sharing overlapping
+            tiling (43 tiles), where neighbouring tiles share their boundary ring.
+
+    Returns:
+        Tile-centre (u, v) tuples, ordered by radius then angle.
+    """
+    (a1, b1), (a2, b2) = tile_basis(tile_extent, share_edges)
+    members = tile_offsets(tile_extent)
+    span = 2 * (extent // max(tile_extent, 1) + 2)
+    centers = []
+    for m in range(-span, span + 1):
+        for n in range(-span, span + 1):
+            cu, cv = m * a1 + n * a2, m * b1 + n * b2
+            if hex_radius(cu, cv) > extent:
+                continue
+            if fully_inside and any(
+                hex_radius(cu + du, cv + dv) > extent for du, dv in members
+            ):
+                continue
+            centers.append((cu, cv))
+    centers.sort(key=lambda c: (hex_radius(*c), _angle(*c)))
+    return centers
+
+
+def _angle(u: int, v: int) -> float:
+    """Pixel-space angle of (u, v), for a stable angular tie-break ordering."""
+    x, y = hex_to_pixel(u, v)
+    return float(np.arctan2(float(y), float(x)))
+
+
+def generate_tiles(
+    extent: int = DEFAULT_EXTENT,
+    tile_extent: int = 2,
+    fully_inside: bool = True,
+    share_edges: bool = False,
+) -> list:
+    """Tiles as ``(center_uv, [member_uv, ...])`` covering an ``extent`` disc.
+
+    See :func:`tile_centers` for ``share_edges`` (disjoint vs edge-sharing layout).
+    """
+    members = tile_offsets(tile_extent)
+    return [
+        ((cu, cv), [(cu + du, cv + dv) for du, dv in members])
+        for cu, cv in tile_centers(extent, tile_extent, fully_inside, share_edges)
+    ]
+
+
 class HexGrid:
     """A hex disc of a given extent with a (u, v) -> hex_index lookup."""
 
@@ -154,6 +288,40 @@ def _draw_hexes(ax, u, v, labels, facecolor, edgecolor, hex_radius, fontsize=3):
             )
 
 
+def draw_fafb_columns(
+    ax,
+    df: pd.DataFrame,
+    hex_radius_px: Optional[float] = None,
+    label: bool = True,
+    fontsize: int = 3,
+    inside_color: Tuple[str, str] = ("lightgreen", "darkgreen"),
+    outside_color: Tuple[str, str] = ("lightcoral", "darkred"),
+) -> None:
+    """Draw one hemisphere's FAFB columns, coloured by inside/outside hex status.
+
+    Reusable drawing primitive: ``df`` carries ``u``, ``v``, ``hex_status`` and
+    ``column_id`` (as produced by :meth:`HexGrid.assign_columns`).
+    """
+    if hex_radius_px is None:
+        hex_radius_px = 0.5 * float(DEFAULT_KERNEL_SIZE)
+    inside = df[df["hex_status"] == "inside"]
+    outside = df[df["hex_status"] == "outside"]
+    in_labels = (
+        inside["column_id"].astype(int).tolist() if label else [None] * len(inside)
+    )
+    out_labels = (
+        outside["column_id"].astype(int).tolist() if label else [None] * len(outside)
+    )
+    _draw_hexes(
+        ax, inside["u"].values, inside["v"].values, in_labels,
+        inside_color[0], inside_color[1], hex_radius_px, fontsize,
+    )
+    _draw_hexes(
+        ax, outside["u"].values, outside["v"].values, out_labels,
+        outside_color[0], outside_color[1], hex_radius_px, fontsize,
+    )
+
+
 def plot_column_map(
     grid: "HexGrid",
     df_left: pd.DataFrame,
@@ -212,16 +380,7 @@ def plot_column_map(
     def _draw_fafb(ax, df, side_label):
         inside = df[df["hex_status"] == "inside"]
         outside = df[df["hex_status"] == "outside"]
-        _draw_hexes(
-            ax, inside["u"].values, inside["v"].values,
-            inside["column_id"].astype(int).tolist(),
-            "lightgreen", "darkgreen", hex_radius,
-        )
-        _draw_hexes(
-            ax, outside["u"].values, outside["v"].values,
-            outside["column_id"].astype(int).tolist(),
-            "lightcoral", "darkred", hex_radius,
-        )
+        draw_fafb_columns(ax, df, hex_radius_px=hex_radius)
         ax.set_title(
             f"FAFB columns ({side_label})\n"
             f"{len(inside)} inside + {len(outside)} outside = {len(df)} total\n"
@@ -259,12 +418,16 @@ def plot_column_map(
     return save_path
 
 
-def _unique_columns(side: str) -> pd.DataFrame:
+def unique_columns(side: str) -> pd.DataFrame:
     """One row per column_id (first p, q) for a hemisphere, from raw data."""
     df = fafb_io.load_column_assignments()
     if "hemisphere" in df.columns:
         df = df[df["hemisphere"] == side]
     return df.groupby("column_id", as_index=False).first()
+
+
+# Backwards-compatible private alias (kept so older callers keep working).
+_unique_columns = unique_columns
 
 
 def main() -> None:
@@ -273,7 +436,7 @@ def main() -> None:
     print(f"extent={grid.extent}, grid columns={grid.n_columns}")
     assigned = {}
     for side in ("left", "right"):
-        cols = grid.assign_columns(_unique_columns(side), side)
+        cols = grid.assign_columns(unique_columns(side), side)
         assigned[side] = cols
         n_inside = int((cols["hex_status"] == "inside").sum())
         n_outside = int((cols["hex_status"] == "outside").sum())

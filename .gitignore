@@ -1,6 +1,13 @@
 .venv/
 
-# FAFB connectome bulky data (regenerate via build_network.py / build_all.py)
+# Python caches
+__pycache__/
+*.pyc
+
+# FAFB connectome: large regenerable data (rebuild via build_network.py / build_all.py)
+# Full-disc network.json are 80-160 MB; keep only the small cropped extent deliverables.
 Connectome/**/network.json
-Connectome/**/*.csv.gz
-Connectome/**/download/
+!Connectome/**/*_extent2_col/network.json
+Connectome/**/connections.csv.gz
+.filter_cache
+Connectome/**/download/connections_princeton.csv.gz

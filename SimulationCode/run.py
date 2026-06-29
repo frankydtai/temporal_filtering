@@ -50,6 +50,10 @@ def make_plots(fname, outdir):
 
 
 def ctype_labels():
+    # When a connectome is active its own type vocabulary is the source of truth;
+    # otherwise fall back to the 65-type Borst ctype.npy.
+    if getattr(fc, "CONNECTOME", None) is not None:
+        return np.asarray(fc.CONNECTOME.type_names)
     path = os.path.join(os.path.dirname(os.path.abspath(fc.__file__)), "Circuits", "ctype.npy")
     return np.load(path, allow_pickle=True)
 
@@ -120,9 +124,16 @@ def apply_param_modes(model_type, param_modes=None, param_fixes=None):
 
 
 def run_training(model_type, nofruns, nofsteps, lrs, fname=None, outdir=None,
-                 no_plots=False, param_modes=None, param_fixes=None):
+                 no_plots=False, param_modes=None, param_fixes=None,
+                 connectome=None, multi_column=False, share_edges=False,
+                 sequential=None):
     """Full training pipeline (do_many_runs + tables + plots). Returns (fname, outdir)."""
     fc.MODEL_TYPE = model_type
+    # Optional connectome backend (rebuilds CONN + schema + target). Must run
+    # BEFORE apply_param_modes so the mode overrides act on the connectome schema.
+    if connectome:
+        fc.use_connectome(connectome, multi_column=multi_column,
+                          share_edges=share_edges, sequential=sequential)
     apply_param_modes(model_type, param_modes, param_fixes)
     suffix = "" if model_type == "conductance" else f"_{model_type}"
     fname = fname or f"training{suffix or '_with_Ih'}.npy"
@@ -164,6 +175,15 @@ def parse_args():
         p.add_argument("--fix", nargs="+", default=[], metavar="NAME=VALUE",
                        help="hold a param fixed at VALUE (implies fixed mode), "
                             "e.g. --fix Ih_midv=-50 out_scale=1.0")
+        p.add_argument("--connectome", default=None, metavar="PATH",
+                       help="path to a connectome network.json; enables the "
+                            "ScatterConn backend (default: Borst 5-column dense)")
+        p.add_argument("--multi_column", action="store_true",
+                       help="connectome multi-column training (7-shift radial target)")
+        p.add_argument("--share_edges", action="store_true",
+                       help="full-graph tiling: 43 edge-sharing tiles (default 31 disjoint)")
+        p.add_argument("--sequential", action="store_true", default=None,
+                       help="force CPU-sequential multi-column cost (default: auto)")
 
     add_common(sub.add_parser("local", help="short local CPU run (CUDA disabled)"), 1, 100)
     add_common(sub.add_parser("gpu", help="full training run"), 20, 10000)
@@ -188,7 +208,9 @@ def main():
     outdir = run_dir(args.model_type, parent=args.outdir)
     run_training(args.model_type, args.nofruns, args.nofsteps, args.lrs,
                  fname=args.fname, outdir=outdir, no_plots=args.no_plots,
-                 param_modes=param_modes, param_fixes=param_fixes)
+                 param_modes=param_modes, param_fixes=param_fixes,
+                 connectome=args.connectome, multi_column=args.multi_column,
+                 share_edges=args.share_edges, sequential=args.sequential)
 
 
 if __name__ == "__main__":

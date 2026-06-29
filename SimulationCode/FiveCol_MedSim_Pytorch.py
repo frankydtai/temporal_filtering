@@ -14,6 +14,8 @@ import torch
 from torch import nn
 from tqdm import tqdm
 
+from connectivity import DenseConn
+
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 #################################################################
@@ -242,6 +244,37 @@ def adaptive_segments():
 
 nofparams_adaptive = schema_nparams(ADAPTIVE_SCHEMA)
 
+
+# --- schema builders for an arbitrary type vocabulary (connectome path) ------
+# The literal CONDUCTANCE_SCHEMA / ADAPTIVE_SCHEMA above are the 65-type Borst
+# defaults. use_connectome() rebuilds equivalents for the connectome's own type
+# count + lamina indices so the SAME training machinery works on 32 (or N) types.
+
+def build_conductance_schema(n_types, lamina, ih_zero=(2, 3)):
+    zero = [j for j in ih_zero if j < len(lamina)]
+    return [
+        {'name': 'inp_gain',  'count': n_types, 'kind': 'full',   'lo': low_gain, 'hi': high_gain, 'init': 0.5,     'jit': 0.2,  'fill': 0.0},
+        {'name': 'out_gain',  'count': n_types, 'kind': 'full',   'lo': low_gain, 'hi': high_gain, 'init': 0.5,     'jit': 0.2,  'fill': 0.0},
+        {'name': 'Ih_gmax',   'count': len(lamina), 'kind': 'lamina', 'cells': lamina, 'lo': 0.0, 'hi': 100.0, 'init': Ih_gmax, 'jit': 10.0, 'fill': 0.0, 'zero': zero},
+        {'name': 'Ih_midv',   'count': 1,       'kind': 'scalar', 'lo': -70.0,    'hi': -30.0,     'init': Ih_midv,  'jit': 5.0},
+        {'name': 'Ih_slope',  'count': 1,       'kind': 'scalar', 'lo': -0.40,    'hi': -0.20,     'init': Ih_slope, 'jit': 0.02},
+        {'name': 'tau_midv',  'count': 1,       'kind': 'scalar', 'lo': -70.0,    'hi': -40.0,     'init': tau_midv, 'jit': 5.0},
+        {'name': 'out_scale', 'count': n_types, 'kind': 'output', 'lo': 0.0,      'hi': 1.0e4,     'init': 1.0,      'jit': 0.0},
+    ]
+
+
+def build_adaptive_schema(n_types, lamina):
+    return [
+        {'name': 'inp_gain',   'count': n_types, 'kind': 'full',   'lo': low_gain, 'hi': high_gain, 'init': 0.5,   'jit': 0.2,  'fill': 0.0},
+        {'name': 'out_gain',   'count': n_types, 'kind': 'full',   'lo': low_gain, 'hi': high_gain, 'init': 0.5,   'jit': 0.2,  'fill': 0.0},
+        {'name': 'tau_m',      'count': n_types, 'kind': 'full',   'lo': deltat,   'hi': 1000.0,    'init': 50.0,  'jit': 10.0, 'fill': 0.0},
+        {'name': 'bias',       'count': n_types, 'kind': 'full',   'lo': -2.0,     'hi': 2.0,       'init': 0.0,   'jit': 0.1,  'fill': 0.0},
+        {'name': 'adapt_gain', 'count': len(lamina), 'kind': 'lamina', 'cells': lamina, 'lo': -2.0, 'hi': 2.0,    'init': 0.0,   'jit': 0.1,  'fill': 0.0},
+        {'name': 'tau_adapt',  'count': len(lamina), 'kind': 'lamina', 'cells': lamina, 'lo': deltat, 'hi': 2000.0, 'init': 100.0, 'jit': 20.0, 'fill': deltat},
+        {'name': 'out_scale',  'count': n_types, 'kind': 'output', 'lo': 0.0,      'hi': 1.0e4,     'init': 1.0,   'jit': 0.0},
+    ]
+
+
 # -------------------------------------------------------------------------
 # -------------- reading cell data and connectivity matrices --------------
 # -------------------------------------------------------------------------
@@ -286,16 +319,37 @@ def init_network():
     return M_exc, M_inh, M_signed, ctype, mc_cell_index, data, power, signal
 
 M_exc, M_inh, M_signed, ctype, mc_cell_index, data, power, signal = init_network()
-        
+
+# ---- connectivity backend (CONN) -------------------------------------------
+# All synaptic drive goes through CONN so the simulator core is agnostic to the
+# backend. The default is DenseConn wrapping the 5-column matrices, which is
+# bit-identical to the historical torch.mv(M_*, x) path. use_connectome() swaps
+# in a ScatterConn read from a network.json without touching the math below.
+#
+# node_type[i] is unit i's cell-TYPE index. For the Borst path it is i % nofcells
+# (so a (65,) per-type param broadcasts to the (325,) state exactly like the old
+# 5x tiling); for a connectome it maps each node to its type vocabulary index.
+NODE_TYPE = (torch.arange(nofcells * nofcols, device=device) % nofcells).long()
+CONN = DenseConn(M_exc, M_inh, M_signed, NODE_TYPE)
+
+# ---- multi-column / connectome training state ------------------------------
+# These stay None for the default Borst path (zero behaviour change). They are
+# populated by use_connectome() for connectome / multi-column training.
+CONNECTOME = None       # the loaded Connectome (None => Borst dense path)
+READOUT = None          # (cost_batch_idx, cost_unit_idx): cost cell selection
+COST_WEIGHT = None      # (n_cost,) per-cost-cell weight (1/ring-size -> equal rings)
+MC_COST_RADIUS = None   # (n_cost,) ring radius {0,1,sqrt3,2} of each cost entry
+MULTI_COLUMN_SEQ = None  # None=auto (CPU sequential, CUDA batched)
+
 # ------- network calculations  -----------------------------------------------
 
 def calc_multi_col_params(param):
-    
-    # turns params for one column into multi-column params
-    
-    multi_col_param = torch.concatenate((param,param,param,param,param))
-        
-    return multi_col_param
+
+    # Broadcast a per-cell-TYPE parameter (n_types,) to the full state (n_units,)
+    # via the backend's node_type. For the Borst path node_type == arange%65, so
+    # this reproduces the old 5x concatenation exactly.
+
+    return param.index_select(0, CONN.node_type)
 
 def rectsyn(x,thrld):
     
@@ -316,8 +370,9 @@ def update_Vm(Vm,u,inp_gain,out_gain,Ih_gmax,Ih_midv,Ih_slope,tau_midv,signal):
     u       = deltat/tau*(Ih_ss-u)+u
     g_Ih    = u * Ih_gmax * Ih_gain
     
-    g_exc   = torch.mv(M_exc,(rectsyn(Vm,trld)*out_gain))*inp_gain
-    g_inh   = torch.mv(M_inh,(rectsyn(Vm,trld)*out_gain))*inp_gain
+    g_exc, g_inh = CONN.exc_inh_drive(rectsyn(Vm,trld)*out_gain)
+    g_exc   = g_exc*inp_gain
+    g_inh   = g_inh*inp_gain
     
     Vm = (g_exc*E_exc + g_inh*E_inh + g_leak*E_leak + E_Ih_eff * g_Ih + cdt*Vm + signal)
     Vm = Vm / (g_exc + g_inh + g_Ih + g_leak + cdt)
@@ -382,7 +437,7 @@ def update_state_adaptive(activity, v_sustained, v_transient, drive_lp, p, x_t, 
     ratio = tau / tau_r
     
     # presynaptic output gain (per source), postsynaptic input gain (per target)
-    syn     = p['inp_gain'] * torch.mv(M_signed, torch.relu(activity) * p['out_gain'])
+    syn     = p['inp_gain'] * CONN.signed_drive(torch.relu(activity) * p['out_gain'])
     X       = bias + syn + x_t
     X_gate  = bias + syn + x_t_delayed
     gate    = (X_gate - p['gate_pivot']) * p['adapt_gain']
@@ -406,29 +461,153 @@ def model_cost(model, data, out_scale=1.0):
     # global linear output gain (default 1.0 -> unscaled).
     return torch.sum((out_scale * model - data[50:200])**2) / power * 100.0
 
-def _run_conductance(p, neuron_index=None, return_ref=False):
+def _run_conductance(p, neuron_index=None, return_ref=False, sig=None):
     # forward pass -> low-pass filtered response for the chosen neurons, shape
     # (150, n). neuron_index defaults to the center-column cost cells (mc_cell_index);
     # plotting passes other columns. return_ref also yields the resting baseline.
+    # sig overrides the module-level stimulus (single-column (T,N) only here).
     inp_gain, out_gain, Ih_gmax = p['inp_gain'], p['out_gain'], p['Ih_gmax']
     Ih_midv, Ih_slope, tau_midv = p['Ih_midv'], p['Ih_slope'], p['tau_midv']
     if neuron_index is None:
         neuron_index = mc_cell_index
+    if sig is None:
+        sig = signal
 
-    u  = torch.zeros(325, dtype=torch.float64).to(device)
+    u  = torch.zeros(CONN.n_units, dtype=torch.float64).to(device)
     Vm = E_leak
     for t in range(1,50):
-        Vm, u = update_Vm(Vm,u,inp_gain,out_gain,Ih_gmax,Ih_midv,Ih_slope,tau_midv,signal[t-1])
+        Vm, u = update_Vm(Vm,u,inp_gain,out_gain,Ih_gmax,Ih_midv,Ih_slope,tau_midv,sig[t-1])
     Vm_ref = 1.0*Vm[neuron_index]  # reference 0
     model = 0; rows = []
     for t in range(50,200):
-        Vm, u = update_Vm(Vm,u,inp_gain,out_gain,Ih_gmax,Ih_midv,Ih_slope,tau_midv,signal[t-1])
+        Vm, u = update_Vm(Vm,u,inp_gain,out_gain,Ih_gmax,Ih_midv,Ih_slope,tau_midv,sig[t-1])
         model = deltat/Ca_tau * (Vm[neuron_index] - Vm_ref - model) + model
         rows.append(model)
     out = torch.stack(rows)
     if return_ref:
         return out, Vm_ref
     return out
+
+
+def _run_conductance_full(p, sig):
+    # Multi-column forward: batched stimulus sig (B, T, N) -> (B, 150, N), the
+    # Ca-filtered response of EVERY unit for every stimulus. Same per-step math as
+    # _run_conductance; the connectivity backend already handles the (B, N) batch.
+    inp_gain, out_gain, Ih_gmax = p['inp_gain'], p['out_gain'], p['Ih_gmax']
+    Ih_midv, Ih_slope, tau_midv = p['Ih_midv'], p['Ih_slope'], p['tau_midv']
+    B = sig.shape[0]
+    u  = torch.zeros((B, CONN.n_units), dtype=torch.float64).to(device)
+    Vm = E_leak.expand(B, CONN.n_units).clone()
+    for t in range(1, 50):
+        Vm, u = update_Vm(Vm,u,inp_gain,out_gain,Ih_gmax,Ih_midv,Ih_slope,tau_midv,sig[:, t-1])
+    Vm_ref = Vm.clone()                              # (B, N)
+    model = 0; rows = []
+    for t in range(50, 200):
+        Vm, u = update_Vm(Vm,u,inp_gain,out_gain,Ih_gmax,Ih_midv,Ih_slope,tau_midv,sig[:, t-1])
+        model = deltat/Ca_tau * (Vm - Vm_ref - model) + model
+        rows.append(model)
+    return torch.stack(rows, dim=1)                  # (B, 150, N)
+
+
+def multicol_cost(z):
+    # Multi-column / connectome cost: batched forward over all stimuli, then the
+    # READOUT (batch, unit) cost cells are compared to the hex radial target with
+    # per-ring COST_WEIGHT (1/ring-size). data/power/READOUT/COST_WEIGHT are the
+    # module globals set by use_connectome().
+    p = assign_params(z, active_schema())
+    model_full = _run_conductance_full(p, signal)     # (B, 150, N)
+    b_idx, u_idx = READOUT
+    sel = model_full[b_idx, :, u_idx]                 # (n_cost, 150)
+    diff = sel - data
+    return torch.sum(COST_WEIGHT[:, None] * diff ** 2) / power * 100.0
+
+
+def multicol_shift_cost(z, shift):
+    # Single-stimulus (one batch index) forward+cost, for CPU-sequential training
+    # that backprops one stimulus at a time to bound peak memory. Mathematically a
+    # partial sum of multicol_cost over the cost cells belonging to this batch.
+    p = assign_params(z, active_schema())
+    sig_b = signal[shift:shift+1]                     # (1, T, N)
+    model_full = _run_conductance_full(p, sig_b)      # (1, 150, N)
+    b_idx, u_idx = READOUT
+    mask = (b_idx == shift)
+    if not bool(mask.any()):
+        return torch.zeros((), dtype=torch.float64, device=device)
+    sel = model_full[0][:, u_idx[mask]].transpose(0, 1)   # (n_sel, 150)
+    diff = sel - data[mask]
+    return torch.sum(COST_WEIGHT[mask][:, None] * diff ** 2) / power * 100.0
+
+
+def use_connectome(network_json, multi_column=True, share_edges=False,
+                   sequential=None, dev=None):
+    """Switch the simulator onto a connectome read from ``network.json``.
+
+    Rebinds the connectivity backend (ScatterConn), the type vocabulary / schema,
+    the resting / Ih state vectors, and the stimulus + hex radial training target.
+    The default Borst 5-column path is unaffected until this is called.
+
+    multi_column: True -> 7-shift batched radial target; False -> single stimulus.
+    share_edges:  31 disjoint tiles (False) vs 43 edge-sharing (True), full graph.
+    sequential:   None -> auto (CPU sequential, CUDA batched).
+    """
+    global CONN, CONNECTOME, NODE_TYPE, nofcells, nofcols
+    global E_LEAK_DEPOL_CELLS, E_leak, Ih_dir
+    global CONDUCTANCE_SCHEMA, ADAPTIVE_SCHEMA, nofparams_adaptive
+    global z_bounds, z_bounds_adaptive
+    global data, power, signal, mc_cell_index
+    global READOUT, COST_WEIGHT, MC_COST_RADIUS, MULTI_COLUMN_SEQ
+
+    from connectome_network import load_connectome
+    from connectome_target import build_shifted_target
+
+    dev = dev or device
+    C = load_connectome(network_json, device=dev,
+                        exc_synweight=exc_synweight, inh_synweight=inh_synweight)
+    CONNECTOME = C
+    CONN = C.conn
+    NODE_TYPE = C.node_type
+    nofcells = C.n_types
+    nofcols = 1
+
+    tn = list(C.type_names)
+    lamina = [tn.index(t) for t in ['L1', 'L2', 'L3', 'L4', 'L5'] if t in tn]
+    E_LEAK_DEPOL_CELLS = [tn.index(t) for t in ['L1', 'L2', 'L3'] if t in tn]
+
+    CONDUCTANCE_SCHEMA = build_conductance_schema(nofcells, lamina)
+    ADAPTIVE_SCHEMA = build_adaptive_schema(nofcells, lamina)
+    nofparams_adaptive = schema_nparams(ADAPTIVE_SCHEMA)
+
+    # per-TYPE resting potential broadcast to the n_units state via node_type.
+    per_type = torch.full((nofcells,), E_LEAK_REST, dtype=torch.float64, device=dev)
+    for c in E_LEAK_DEPOL_CELLS:
+        per_type[c] = E_LEAK_DEPOL
+    E_leak = calc_multi_col_params(per_type)
+    Ih_dir = torch.ones(CONN.n_units, dtype=torch.float64, device=dev)
+
+    z_bounds = calc_z_bounds()
+    z_bounds_adaptive = calc_z_bounds_adaptive()
+
+    T = build_shifted_target(
+        C, share_edges=share_edges, single_shift=not multi_column, device=dev,
+        signal_baseline=signal_baseline, signal_amp=signal_amp, data_amp=data_amp,
+    )
+    signal = T.signal
+    data = T.data
+    power = T.power
+    COST_WEIGHT = T.cost_weight
+    MC_COST_RADIUS = T.cost_radius
+    READOUT = (T.readout_batch, T.readout_unit)
+    mc_cell_index = T.readout_unit          # plotting / out_scale fallback
+    MULTI_COLUMN_SEQ = (dev == 'cpu') if sequential is None else bool(sequential)
+
+    tag = "multi-column" if multi_column else "single-column"
+    seqtag = ", sequential CPU" if MULTI_COLUMN_SEQ else ""
+    print(f"connectome: {network_json}")
+    print(f"  {tag} (B={T.n_batch} stimuli [{T.info['n_centers']} tiles x "
+          f"{T.info['n_shifts']} shifts], {T.info['n_cost']} cost cells{seqtag})")
+    print(f"  n_units={CONN.n_units}, n_types={nofcells}, "
+          f"nparams={schema_nparams(active_schema())}")
+    return C
 
 def simulate_conductance(z):
     return _run_conductance(assign_params(z, CONDUCTANCE_SCHEMA))
@@ -484,6 +663,15 @@ def simulate_adaptive(z, inp_scalar=None, return_diag=False):
 def calc_cost(z, data, out_scale=1.0):
     # out_scale (the arg) multiplies on top of any 'out_scale' parameter declared in
     # the active schema, so legacy callers (arg) and schema-driven training both work.
+    # When a connectome multi-column target is active (signal is (B, T, N)), route to
+    # the batched radial-target cost; the Borst 5-column path is untouched.
+    if CONNECTOME is not None and signal.dim() == 3:
+        if MULTI_COLUMN_SEQ:
+            total = 0.0
+            for b in range(signal.shape[0]):
+                total = total + multicol_shift_cost(z, b)
+            return total
+        return multicol_cost(z)
     schema = active_schema()
     p = assign_params(z, schema)
     if MODEL_TYPE == 'adaptive':

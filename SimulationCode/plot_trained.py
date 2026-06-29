@@ -198,14 +198,61 @@ def calc_model_full_all(z, model_type=None, return_ref=False):
     return model_full
 
 
-def _scale_curve(xt, center):
-    """Impulse response (time) and amplitude-scaled azimuth RF for one cube."""
+def _scale_curve(xt, center, sem_xt=None):
+    """Impulse response (time) and amplitude-scaled azimuth RF for one cube.
+
+    If ``sem_xt`` (same shape as ``xt``) is given, also return the center-row time
+    SEM aligned to the impulse response (for a +/-SEM band on the model trace).
+    """
     imp = xt[center]
     maxt = int(np.argmax(np.abs(imp)))
     rf = bs.blurr(bs.rebin(xt[:, maxt], 45), 5)
     amp = float(np.max(np.abs(imp)))
     rf = rf / (np.max(np.abs(rf)) + 1e-12) * amp
+    if sem_xt is not None:
+        return imp, np.roll(rf, -2), sem_xt[center]
     return imp, np.roll(rf, -2)
+
+
+# ---- connectome multi-column cube (averaged over tiles x shifts x ring) ------
+
+@torch.no_grad()
+def _multicol_cube(z):
+    """Build a (n_fit, 9, 200) model cube + SEM by averaging the batched forward.
+
+    Runs the 7-shift (B) connectome forward, then for each fit cell type bins every
+    readout cell by its ring radius. Following the single-column azimuth convention
+    the ring radius is truncated with int() for DISPLAY (so sqrt(3) -> bin 1, same
+    as col +/-1); training itself keeps sqrt(3) and 2 as distinct rings. Each bin is
+    averaged over all tiles x shifts x ring members; sem = std/sqrt(n).
+    Returns (names, cube, sem) for the present fit types.
+    """
+    p = fc.assign_params(z, fc.CONDUCTANCE_SCHEMA)
+    model_full = fc._run_conductance_full(p, fc.signal)        # (B, 150, N)
+    b_idx, u_idx = fc.READOUT
+    sel = model_full[b_idx, :, u_idx].cpu().numpy()            # (n_cost, 150)
+    radius = fc.MC_COST_RADIUS.cpu().numpy()                   # (n_cost,)
+    type_idx = fc.CONNECTOME.node_type[u_idx].cpu().numpy()    # (n_cost,)
+    type_names = list(fc.CONNECTOME.type_names)
+
+    names = [ft for ft in CELL_LIST if ft in type_names]
+    cube = np.zeros((len(names), 9, 200))
+    sem = np.zeros((len(names), 9, 200))
+    center = 4
+    for ti, ft in enumerate(names):
+        ft_global = type_names.index(ft)
+        for off in range(5):                                  # azimuth offset 0..4
+            mask = (type_idx == ft_global) & (np.floor(radius).astype(int) == off)
+            if not mask.any():
+                continue
+            traces = sel[mask]                                # (k, 150)
+            m = traces.mean(axis=0)
+            s = traces.std(axis=0) / np.sqrt(traces.shape[0])
+            for bin_j in {center + off, center - off}:        # mirror to both sides
+                if 0 <= bin_j < 9:
+                    cube[ti, bin_j, 50:200] = m
+                    sem[ti, bin_j, 50:200] = s
+    return names, cube, sem
 
 
 def _nice_ylim(*curves, margin=1.25, step=5.0, floor=5.0, min_pad=3.0):
@@ -276,6 +323,75 @@ def _plot_cell_pair_axes(ax_rf, ax_time, model_xt, ref_xt, title, show_legend=Fa
         ax_time.set_ylabel('mV', fontsize=7)
     ax_time.tick_params(labelsize=6)
     _annotate_baseline(ax_time, baseline)
+
+
+def _plot_cell_pair_sem(ax_rf, ax_time, model_xt, sem_xt, ref_xt, title,
+                        show_legend=False, show_xlabels=False, show_ylabel=False):
+    """Like _plot_cell_pair_axes but draws a pink +/-SEM band on the model trace.
+
+    Used for connectome multi-column plots, where each trace is a mean over many
+    tiles x shifts x ring members and the SEM (~0.06 mV) is small relative to the
+    +/-20 mV data; the y-limit is set from model+SEM so the band is visible.
+    """
+    center = 4
+    imp_model, rf_model, imp_sem = _scale_curve(model_xt, center, sem_xt)
+    if ref_xt is not None:
+        imp_data, rf_data = _scale_curve(ref_xt, center)
+    else:
+        imp_data, rf_data = None, None
+    curves = [c for c in (imp_model, imp_model + imp_sem, imp_model - imp_sem,
+                          rf_model, imp_data, rf_data) if c is not None]
+    ylo, yhi = _nice_ylim(*curves)
+
+    if rf_data is not None:
+        ax_rf.plot(rf_data, color='gray', linewidth=1.5, label='data')
+    ax_rf.plot(rf_model, color='red', linewidth=1.5, label='model')
+    ax_rf.set_title(title, fontsize=8, pad=2)
+    ax_rf.set_ylim(ylo, yhi)
+    _style_azimuth_axis(ax_rf, show_xlabels)
+    if show_ylabel:
+        ax_rf.set_ylabel('mV', fontsize=7)
+    ax_rf.tick_params(labelsize=6)
+    if show_legend:
+        ax_rf.legend(loc='upper right', fontsize=6, frameon=False)
+
+    t = np.arange(200)
+    if imp_data is not None:
+        ax_time.plot(imp_data, color='gray', linewidth=1.5)
+    ax_time.fill_between(t, imp_model - imp_sem, imp_model + imp_sem,
+                         color='pink', alpha=0.8, linewidth=0, label='$\\pm$SEM')
+    ax_time.plot(imp_model, color='red', linewidth=1.5)
+    ax_time.set_ylim(ylo, yhi)
+    _style_time_axis(ax_time, show_xlabels)
+    if show_ylabel:
+        ax_time.set_ylabel('mV', fontsize=7)
+    ax_time.tick_params(labelsize=6)
+
+
+def plot_model_vs_data_connectome(z, path, title=None):
+    """Connectome model-vs-data: each fit type's ring-averaged trace + SEM band."""
+    names, cube, sem = _multicol_cube(z)
+    ncols = 5
+    nrows = 2 * ((len(names) + ncols - 1) // ncols)
+    fig = plt.figure(figsize=(3.0 * ncols, 2.5 * nrows))
+    gs = fig.add_gridspec(nrows, ncols, hspace=0.55, wspace=0.55,
+                          top=0.93, bottom=0.06, left=0.07, right=0.98)
+    legend_done = False
+    for i, name in enumerate(names):
+        blk, col = divmod(i, ncols)
+        ax_rf = fig.add_subplot(gs[2 * blk, col])
+        ax_time = fig.add_subplot(gs[2 * blk + 1, col])
+        _plot_cell_pair_sem(
+            ax_rf, ax_time, cube[i], sem[i], reference_cube(name), name,
+            show_legend=not legend_done, show_xlabels=True, show_ylabel=(col == 0),
+        )
+        legend_done = True
+    if title is None:
+        title = 'Connectome model vs data'
+    n_tiles = fc.CONNECTOME.meta.get('n_centers', '?') if fc.CONNECTOME else '?'
+    fig.suptitle(title + '  [avg over tiles x 7 shifts x ring]', fontsize=12)
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
 
 
 def plot_cost(costs, path):
@@ -434,8 +550,13 @@ def plot_param_set(params, outdir, costs=None, model_type=None):
     suffix = f'trained, cost {best_cost:.2f}% of data power'
     mvd = os.path.join(outdir, 'model_vs_data.png')
     allc = os.path.join(outdir, 'model_all_cells.png')
-    plot_model_vs_data(z, mvd, title=f'Model vs data ({suffix})')
-    plot_all_celltypes(z, allc, title=f'All 65 cell types ({suffix})')
+    if getattr(fc, 'CONNECTOME', None) is not None:
+        # connectome multi-column: ring-averaged cube + SEM (Borst layout doesn't
+        # apply -- no 5 fixed columns / 65 named types).
+        plot_model_vs_data_connectome(z, mvd, title=f'Connectome model vs data ({suffix})')
+    else:
+        plot_model_vs_data(z, mvd, title=f'Model vs data ({suffix})')
+        plot_all_celltypes(z, allc, title=f'All 65 cell types ({suffix})')
     np.save(os.path.join(outdir, 'best_param.npy'), best)
     print(f'plots saved to {outdir}')
     return best, best_cost
