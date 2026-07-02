@@ -3,13 +3,12 @@ description: Project coding conventions for the temporal_filtering model code
 alwaysApply: true
 ---
 
-# Coding Conventions (temporal_filtering)
+# Coding Conventions (drosophila_vision)
 
-## 1. Always run Python via .venv
-- ALWAYS execute Python through the project virtual environment at
-  `.venv` (e.g. `.venv/bin/python <script>`). Never call bare `python` /
-  `python3`. The required packages (numpy, torch, matplotlib, ...) live ONLY
-  in `.venv`. Every folder under drosophila_vision should have its own .venv. If not, create an empty one for it.
+> **Before anything else:** read `00-python-venv.mdc` (Python must use the correct `.venv`) and `01-no-new-scripts.mdc` (Agent must not create new scripts without your explicit approval).
+
+## 1. Always run Python via `.venv`
+- **See `.cursor/rules/00-python-venv.mdc`** — single source of truth. Never bare `python` / `python3`.
 
 ## 2. Schema is the single source of truth
 - Model parameters MUST be defined in a schema (`ADAPTIVE_SCHEMA`, `CONDUCTANCE_SCHEMA`).
@@ -56,3 +55,10 @@ alwaysApply: true
 - NO hardcoded directory-name strings in scripts (no `DATA_DIR / "column_location"`,
   no `OUTPUT_SUBDIR = "..."`). Moving/renaming a folder must be a ONE-line change in
   the I/O module, with every dependent script picking it up automatically.
+
+## 11. Adding new scripts requires prior approval
+- Before creating **any new script file** (`*.py`, `*.sh`, or similar), Agent must:
+  - First explain **why a new script is necessary** instead of extending an existing one.
+  - Propose the **script name, location, and rough responsibilities**.
+  - **Wait for explicit approval from the user** in chat.
+- It is **strictly forbidden** to create new scripts without this prior approval.

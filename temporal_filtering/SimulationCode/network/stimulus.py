@@ -7,8 +7,8 @@ units on a loaded :class:`network.construction.Network`.
 
 ``build_moving_bar_signals`` returns ``signal`` with shape ``(B, T, N_units)``,
 ready to assign to ``FiveCol_MedSim_Pytorch.signal``. Default ``T`` is
-``t_on`` (0.5 s baseline) plus the steps needed for the bar to sweep the
-photo field, not the global Borst ``IMPULSE_MAXTIME``.
+``t_on`` (0.5 s baseline) + sweep + ``T_TAIL`` (0.5 s post-stimulus baseline),
+not the global Borst ``IMPULSE_MAXTIME``.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-import connectome_path  # noqa: F401
+import network_bootstrap  # noqa: F401
 
 from column_mapper import DEFAULT_KERNEL_SIZE, hex_to_pixel
 from connectome_io import moving_bar_cache_dir
@@ -36,6 +36,7 @@ from visual_stimulus.moving_bar_stimulus import (
     gruntman_moving_bar_specs,
     hex_vertices,
     moving_bar_maxtime,
+    moving_bar_sweep_end_step,
 )
 
 logger = logging.getLogger(__name__)
@@ -93,6 +94,27 @@ def _photo_columns(C) -> List[PhotoColumn]:
             unit_idx=np.asarray(units, dtype=np.int64),
         )
     return [cols[k] for k in sorted(cols)]
+
+
+def photo_columns(C) -> List[PhotoColumn]:
+    """Photo columns with photoreceptor units (one per axial ``(u, v)``)."""
+    return _photo_columns(C)
+
+
+def center_photo_column(C) -> PhotoColumn:
+    """Photo column at hex origin ``(u, v) = (0, 0)``, or closest to field centre."""
+    cols = photo_columns(C)
+    if not cols:
+        raise ValueError("network has no photo columns")
+    for col in cols:
+        if col.u == 0 and col.v == 0:
+            return col
+    return min(cols, key=lambda c: c.x * c.x + c.y * c.y)
+
+
+def cost_photo_columns(C, center_column: bool = False) -> List[PhotoColumn]:
+    """Columns used for moving-bar cost: all photo columns, or centre only."""
+    return [center_photo_column(C)] if center_column else photo_columns(C)
 
 
 def _as_hex_columns(columns: Sequence[PhotoColumn]) -> List[HexColumn]:
@@ -230,11 +252,13 @@ def build_moving_bar_signals(
     """Build batched photoreceptor current for moving-bar stimuli.
 
     Returns ``signal`` with shape ``(B, T, N_units)`` where ``B = len(specs)``
-    (16 by default). Before ``t_on`` all currents are ``i_baseline``.
+    (16 by default). Before ``t_on`` and after the sweep, all currents are
+    ``i_baseline``; during the sweep they follow bar coverage (bright/dark).
 
-    Default ``maxtime`` is ``t_on`` plus the steps needed for the bar to sweep
-    the photo field (not the global ``IMPULSE_MAXTIME`` used by Borst training).
-    Pass an explicit ``maxtime`` to override.
+    Default ``maxtime`` is ``t_on`` (0.5 s baseline) + sweep + ``T_TAIL``
+    (0.5 s post-stimulus baseline) via :func:`visual_stimulus.moving_bar_stimulus.moving_bar_maxtime`,
+    not the global ``IMPULSE_MAXTIME`` used by Borst training. Pass an explicit
+    ``maxtime`` to override.
 
     Column currents ``(B, T, n_cols)`` are cached under
     ``<network_run>/moving_bar_cache/`` (see ``connectome_io.moving_bar_cache_dir``).
@@ -249,7 +273,9 @@ def build_moving_bar_signals(
         maxtime = moving_bar_maxtime(specs, field_deg, t_on=t_on, deltat_ms=deltat_ms)
     n_batch = len(specs)
     n_units = C.n_units
-    sweep_steps = maxtime - t_on
+    sweep_end = moving_bar_sweep_end_step(specs, field_deg, t_on=t_on, deltat_ms=deltat_ms)
+    sweep_steps = sweep_end - t_on
+    tail_steps = maxtime - sweep_end
 
     cache_path: Optional[Path] = None
     source_json = Path(network_json) if network_json is not None else getattr(C, "source_json", None)
@@ -282,8 +308,11 @@ def build_moving_bar_signals(
         "field_deg": field_deg,
         "maxtime": maxtime,
         "t_on": t_on,
+        "sweep_end": sweep_end,
         "sweep_steps": sweep_steps,
         "sweep_time_s": sweep_steps * deltat_ms / 1000.0,
+        "tail_steps": tail_steps,
+        "tail_time_s": tail_steps * deltat_ms / 1000.0,
         "i_bright": SIGNAL_BRIGHT,
         "i_dark": SIGNAL_DARK,
         "i_baseline": i_baseline,

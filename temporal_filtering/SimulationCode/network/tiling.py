@@ -22,13 +22,14 @@ from typing import List, Tuple
 
 import numpy as np
 
-import connectome_path  # noqa: F401
+import network_bootstrap  # noqa: F401
 
 import column_mapper
 
 from Medulla_Library import cell_list as _CELL_LIST
 
 FIT_CELL_TYPES: List[str] = [str(c) for c in _CELL_LIST]  # 13 fit types
+CENTER_COLUMN_UV = (0, 0)
 
 
 def euclid_hex_dist(du: int, dv: int) -> float:
@@ -100,8 +101,12 @@ def build_tiling(
     tile_extent: int = 2,
     share_edges: bool = False,
     single_tile: bool = None,
+    center_column: bool = False,
 ) -> Tiling:
     """Build a :class:`Tiling` for connectome ``C``.
+
+    If ``center_column`` is True, force one centre tile at ``(u,v)=(0,0)``
+    with no sub-tile shifts.
 
     If ``single_tile`` (default: auto when the graph's own extent <= tile_extent),
     the whole graph is one tile centred at (0, 0) -- the right case for an
@@ -113,6 +118,15 @@ def build_tiling(
     spanned by the positioned columns (otherwise the full graph would collapse to
     a single tile).
     """
+    if center_column:
+        return Tiling(
+            centers=[CENTER_COLUMN_UV],
+            members=[(0, 0)],
+            shifts=[(0, 0)],
+            tile_extent=tile_extent,
+            share_edges=share_edges,
+        )
+
     graph_extent = _graph_extent(C, tile_extent)
     if single_tile is None:
         single_tile = graph_extent <= tile_extent

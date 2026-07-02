@@ -28,9 +28,9 @@ DEFAULT_PDF = HERE / "paper.pdf"
 DEFAULT_PAGE = 4
 DEFAULT_DPI = 400
 
-# Trace window length (ms). Time axis starts at 0 at the first extracted sample.
-TIME_MIN_MS = 0.0
-TIME_MAX_MS = 900.0
+# Paper Ci/Cii x-axis: 900 ms total, bar centre at mid-panel -> -450..+450 ms.
+TIME_MIN_MS = -450.0
+TIME_MAX_MS = 450.0
 # 10 mV scale bar ≈ 100 px on 400 dpi render (measured on w1 panels).
 PX_PER_MV = 10.0
 
@@ -215,7 +215,6 @@ def extract_trace(
     ys_a = median_filter(np.asarray(ys, dtype=float), size=9)
     x_crop = calib.left + xs_a
     time_ms = np.array([pixel_to_time_ms(x, calib) for x in x_crop])
-    time_ms = time_ms - time_ms[0]  # first sample = 0 ms
     # Baseline-subtracted traces: first sample = 0 mV (matches the paper).
     vm_mv = (ys_a[0] - ys_a) / PX_PER_MV
     return time_ms, vm_mv
@@ -280,7 +279,7 @@ def plot_check(df: pd.DataFrame, path: Path) -> None:
         ax.set_xlabel("time (ms)")
         if col == 0:
             ax.set_ylabel("Vm (mV)")
-        ax.set_xlim(0, TIME_MAX_MS)
+        ax.set_xlim(TIME_MIN_MS, TIME_MAX_MS)
         ax.set_ylim(ylo, yhi)
         ax.legend(fontsize=7)
     fig.suptitle(f"Digitized Figure 1 Ci/Cii  (Vm: {ylo:.0f}..{yhi:.0f} mV)")

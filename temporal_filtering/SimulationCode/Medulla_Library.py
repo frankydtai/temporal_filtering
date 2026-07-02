@@ -20,6 +20,7 @@ nofcols  = 5
 # Single source of truth for simulation / training horizon (10 ms per step).
 IMPULSE_MAXTIME = 200
 T_ON = 50
+T_TAIL = 50  # post-stimulus baseline for moving-bar runs (0.5 s @ 10 ms/step)
 SIGNAL_BASELINE = 20.0  # pA photoreceptor current before T_ON
 SIGNAL_BRIGHT = 40.0    # pA photoreceptor current at bright / on-step peak
 SIGNAL_DARK = 0.0       # pA photoreceptor current at full dark-bar coverage
@@ -249,7 +250,7 @@ def read_RecF_ImpR():
 
     Split out of read_RecF_data so callers that need the continuous spatial RF
     (RecF_data) or the temporal kernel (ImpR_data) on their own -- e.g. the hex
-    radial target, which samples RecF at non-integer column distances (sqrt(3)) --
+    tile target, which samples RecF at non-integer column distances (sqrt(3)) --
     use the EXACT same construction the 5-column model uses (single source).
     """
 

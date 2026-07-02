@@ -10,7 +10,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 os.chdir(ROOT)
 
-import connectome_path  # noqa: F401
+import network_bootstrap  # noqa: F401
 from visual_stimulus.moving_bar_stimulus import (
     HexColumn,
     MovingBarSpec,

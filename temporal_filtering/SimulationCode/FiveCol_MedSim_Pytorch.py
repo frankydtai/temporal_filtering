@@ -5,6 +5,10 @@ Created on Wed Jul 26 09:53:25 2023
 @author: aborst
 """
 import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Optional
+
 import numpy as np
 import matplotlib.pyplot as plt
 import Medulla_Library as ml
@@ -336,8 +340,28 @@ CONN = DenseConn(M_exc, M_inh, M_signed, NODE_TYPE)
 NETWORK = None       # the loaded Network (None => Borst dense path)
 READOUT = None          # (cost_batch_idx, cost_unit_idx): cost cell selection
 COST_WEIGHT = None      # (n_cost,) per-cost-cell weight (1/ring-size -> equal rings)
+COST_T0 = None          # (n_cost,) absolute step for windowed cost (moving-bar)
 MC_COST_RADIUS = None   # (n_cost,) ring radius {0,1,sqrt3,2} of each cost entry
+TARGET_KIND = None      # "tile" | "moving_bar" | None
+MOVING_BAR_CENTER_COLUMN = False
+NETWORK_TRAIN_OPTS = None  # last use_network() kwargs for run sidecar / plot restore
 MULTI_COLUMN_SEQ = None  # None=auto (CPU sequential, CUDA batched)
+TARGET_PACKS = None  # None or dict name->TargetPack (multi-target training)
+TARGET_PACK_WEIGHTS = None  # None or dict name->float (loss weights)
+
+
+@dataclass(frozen=True)
+class TargetPack:
+    """One training target: stimulus + readout indices + target traces."""
+
+    name: str
+    signal: torch.Tensor  # (B, T, N)
+    data: torch.Tensor  # (n_cost, T')
+    power: torch.Tensor  # scalar
+    cost_weight: torch.Tensor  # (n_cost,)
+    readout_batch: torch.Tensor  # (n_cost,)
+    readout_unit: torch.Tensor  # (n_cost,)
+    cost_t0: Optional[torch.Tensor] = None  # (n_cost,) absolute step for windowed targets
 
 # ------- network calculations  -----------------------------------------------
 
@@ -508,15 +532,76 @@ def _run_conductance_full(p, sig):
     return torch.stack(rows, dim=1)                  # (B, t_end-t_on, N)
 
 
+def _window_time_traces(model_full, b_idx, u_idx, t0, win=None):
+    """Extract per-readout windows from ``model_full`` (B, T', N).
+
+    ``t0`` is the absolute simulation step of window start. Steps before ``t_on``
+    are zero (``model_full`` only exists from ``t_on`` onward).
+    """
+    win = int(data.shape[1] if win is None else win)
+    t_rel = t0[:, None] - t_on + torch.arange(win, dtype=torch.long, device=device)
+    t_max = model_full.shape[1] - 1
+    pre = t_rel < 0
+    t_safe = t_rel.clamp(0, t_max)
+    sel = model_full[b_idx[:, None], t_safe, u_idx[:, None]]
+    return torch.where(pre, torch.zeros_like(sel), sel)
+
+
+def _readout_model_traces(model_full, b_idx, u_idx, cost_t0=None):
+    """Select model traces for cost cells; windowed when ``cost_t0`` / ``COST_T0`` is set."""
+    t0 = COST_T0 if cost_t0 is None else cost_t0
+    if t0 is None:
+        return model_full[b_idx, :, u_idx]
+    return _window_time_traces(model_full, b_idx, u_idx, t0, win=data.shape[1])
+
+
+def _readout_model_traces_pack(model_full, pack: TargetPack):
+    """Like _readout_model_traces but driven by a TargetPack (no globals)."""
+    if pack.cost_t0 is None:
+        return model_full[pack.readout_batch, :, pack.readout_unit]
+    return _window_time_traces(
+        model_full, pack.readout_batch, pack.readout_unit, pack.cost_t0,
+        win=pack.data.shape[1],
+    )
+
+
+def _pack_cost(z, pack: TargetPack):
+    p = assign_params(z, active_schema())
+    model_full = _run_conductance_full(p, pack.signal)  # (B, T-t_on, N)
+    sel = _readout_model_traces_pack(model_full, pack)
+    diff = sel - pack.data
+    return torch.sum(pack.cost_weight[:, None] * diff ** 2) / pack.power * 100.0
+
+
+def _pack_shift_cost(z, pack: TargetPack, shift: int):
+    """CPU-sequential cost for one batch index of a TargetPack."""
+    p = assign_params(z, active_schema())
+    sig_b = pack.signal[shift:shift + 1]  # (1, T, N)
+    model_full = _run_conductance_full(p, sig_b)  # (1, T-t_on, N)
+    mask = (pack.readout_batch == int(shift))
+    if not bool(mask.any()):
+        return torch.zeros((), dtype=torch.float64, device=device)
+    u_m = pack.readout_unit[mask]
+    if pack.cost_t0 is None:
+        sel = model_full[0, :, u_m].transpose(0, 1)
+    else:
+        b_zero = torch.zeros_like(u_m)
+        sel = _window_time_traces(
+            model_full, b_zero, u_m, pack.cost_t0[mask],
+            win=pack.data.shape[1],
+        )
+    diff = sel - pack.data[mask]
+    return torch.sum(pack.cost_weight[mask][:, None] * diff ** 2) / pack.power * 100.0
+
+
 def multicol_cost(z):
     # Multi-column / network cost: batched forward over all stimuli, then the
-    # READOUT (batch, unit) cost cells are compared to the hex radial target with
-    # per-ring COST_WEIGHT (1/ring-size). data/power/READOUT/COST_WEIGHT are the
-    # module globals set by use_network().
+    # READOUT (batch, unit) cost cells are compared to the target with
+    # per-ring COST_WEIGHT (tile) or per-column windows (moving-bar).
     p = assign_params(z, active_schema())
-    model_full = _run_conductance_full(p, signal)     # (B, maxtime-t_on, N)
+    model_full = _run_conductance_full(p, signal)     # (B, T-t_on, N)
     b_idx, u_idx = READOUT
-    sel = model_full[b_idx, :, u_idx]                 # (n_cost, maxtime-t_on)
+    sel = _readout_model_traces(model_full, b_idx, u_idx)
     diff = sel - data
     return torch.sum(COST_WEIGHT[:, None] * diff ** 2) / power * 100.0
 
@@ -527,25 +612,42 @@ def multicol_shift_cost(z, shift):
     # partial sum of multicol_cost over the cost cells belonging to this batch.
     p = assign_params(z, active_schema())
     sig_b = signal[shift:shift+1]                     # (1, T, N)
-    model_full = _run_conductance_full(p, sig_b)      # (1, maxtime-t_on, N)
+    model_full = _run_conductance_full(p, sig_b)      # (1, T-t_on, N)
     b_idx, u_idx = READOUT
     mask = (b_idx == shift)
     if not bool(mask.any()):
         return torch.zeros((), dtype=torch.float64, device=device)
-    sel = model_full[0][:, u_idx[mask]].transpose(0, 1)   # (n_sel, 150)
+    u_m = u_idx[mask]
+    if COST_T0 is None:
+        sel = model_full[0, :, u_m].transpose(0, 1)
+    else:
+        b_zero = torch.zeros_like(u_m)
+        sel = _window_time_traces(model_full, b_zero, u_m, COST_T0[mask], win=data.shape[1])
     diff = sel - data[mask]
     return torch.sum(COST_WEIGHT[mask][:, None] * diff ** 2) / power * 100.0
 
 
-def use_network(network_json, multi_column=True, share_edges=False,
-                   sequential=None, dev=None):
+def use_network(
+    network_json,
+    multi_column=True,
+    share_edges=False,
+    sequential=None,
+    dev=None,
+    target="tile",
+    moving_bar_center_column=False,
+    target_list=None,
+    loss_weights=None,
+    tile_center_column=False,
+):
     """Switch the simulator onto a network read from ``network.json``.
 
     Rebinds the connectivity backend (ScatterConn), the type vocabulary / schema,
-    the resting / Ih state vectors, and the stimulus + hex radial training target.
+    the resting / Ih state vectors, and the stimulus + training target.
     The default Borst 5-column path is unaffected until this is called.
 
-    multi_column: True -> 7-shift batched radial target; False -> single stimulus.
+    target: ``tile`` (hex RecF×ImpR) or ``moving_bar`` (fig1_ci + per-column windows).
+    moving_bar_center_column: if True, moving-bar cost uses hex centre column only.
+    multi_column: True -> 7-shift batched tile target; False -> single stimulus.
     share_edges:  31 disjoint tiles (False) vs 43 edge-sharing (True), full graph.
     sequential:   None -> auto (CPU sequential, CUDA batched).
     """
@@ -553,11 +655,12 @@ def use_network(network_json, multi_column=True, share_edges=False,
     global E_LEAK_DEPOL_CELLS, E_leak, Ih_dir
     global CONDUCTANCE_SCHEMA, ADAPTIVE_SCHEMA, nofparams_adaptive
     global z_bounds, z_bounds_adaptive
-    global data, power, signal, mc_cell_index
-    global READOUT, COST_WEIGHT, MC_COST_RADIUS, MULTI_COLUMN_SEQ
+    global data, power, signal, mc_cell_index, maxtime
+    global READOUT, COST_WEIGHT, COST_T0, MC_COST_RADIUS, TARGET_KIND, MULTI_COLUMN_SEQ
+    global NETWORK_TRAIN_OPTS, MOVING_BAR_CENTER_COLUMN
+    global TARGET_PACKS, TARGET_PACK_WEIGHTS
 
     from network.construction import load_network
-    from network.target import build_shifted_target
 
     dev = dev or device
     C = load_network(network_json, device=dev,
@@ -586,26 +689,128 @@ def use_network(network_json, multi_column=True, share_edges=False,
     z_bounds = calc_z_bounds()
     z_bounds_adaptive = calc_z_bounds_adaptive()
 
-    T = build_shifted_target(
-        C, share_edges=share_edges, single_shift=not multi_column, device=dev,
-        maxtime=maxtime, t_on=t_on,
-    )
-    signal = T.signal
-    data = T.data
-    power = T.power
-    COST_WEIGHT = T.cost_weight
-    MC_COST_RADIUS = T.cost_radius
-    READOUT = (T.readout_batch, T.readout_unit)
-    mc_cell_index = T.readout_unit          # plotting / out_scale fallback
-    MULTI_COLUMN_SEQ = (dev == 'cpu') if sequential is None else bool(sequential)
+    # Multi-target mode: build a TargetPack per requested target name, then calc_cost()
+    # sums them (optionally weighted). We still keep the legacy globals pointed at
+    # the FIRST target for compatibility with code paths that assume `signal/data`.
+    TARGET_PACKS = None
+    TARGET_PACK_WEIGHTS = None
+    if target_list is not None:
+        if isinstance(target_list, str):
+            target_list = [t.strip() for t in str(target_list).split(",") if t.strip()]
+        target_list = list(target_list)
+        packs: Dict[str, TargetPack] = {}
+        for tname in target_list:
+            if tname == "moving_bar":
+                from network.moving_bar_target import build_moving_bar_target
+                Tm = build_moving_bar_target(
+                    C, device=dev, t_on=t_on, center_column=moving_bar_center_column,
+                )
+                packs[tname] = TargetPack(
+                    name=tname,
+                    signal=Tm.signal,
+                    data=Tm.data,
+                    power=Tm.power,
+                    cost_weight=Tm.cost_weight,
+                    readout_batch=Tm.readout_batch,
+                    readout_unit=Tm.readout_unit,
+                    cost_t0=Tm.cost_t0,
+                )
+            elif tname == "tile":
+                from network.target import build_shifted_target
+                Tr = build_shifted_target(
+                    C,
+                    share_edges=share_edges,
+                    single_shift=not multi_column,
+                    device=dev,
+                    maxtime=maxtime,
+                    t_on=t_on,
+                    center_column=bool(tile_center_column),
+                )
+                packs[tname] = TargetPack(
+                    name=tname,
+                    signal=Tr.signal,
+                    data=Tr.data,
+                    power=Tr.power,
+                    cost_weight=Tr.cost_weight,
+                    readout_batch=Tr.readout_batch,
+                    readout_unit=Tr.readout_unit,
+                    cost_t0=None,
+                )
+            else:
+                raise ValueError(f"unknown target {tname!r} (expected moving_bar|tile)")
 
-    tag = "multi-column" if multi_column else "single-column"
+        TARGET_PACKS = packs
+        TARGET_PACK_WEIGHTS = {str(k): float(v) for k, v in (loss_weights or {}).items()}
+        TARGET_KIND = "multi"
+        first = packs[target_list[0]]
+        signal = first.signal
+        data = first.data
+        power = first.power
+        COST_WEIGHT = first.cost_weight
+        COST_T0 = first.cost_t0
+        READOUT = (first.readout_batch, first.readout_unit)
+        mc_cell_index = first.readout_unit
+        MC_COST_RADIUS = torch.zeros(first.cost_weight.shape[0], dtype=torch.float64, device=dev)
+        maxtime = int(first.signal.shape[1])
+        tag = f"multi-target ({'+'.join(target_list)})"
+        target_norm = "multi"
+    else:
+        if target not in ("tile", "moving_bar"):
+            raise ValueError(f"unknown target {target!r} (expected tile|moving_bar)")
+        target_norm = "moving_bar" if target == "moving_bar" else "tile"
+        if target_norm == "moving_bar":
+            from network.moving_bar_target import build_moving_bar_target
+            T = build_moving_bar_target(
+                C, device=dev, t_on=t_on, center_column=moving_bar_center_column,
+            )
+            TARGET_KIND = "moving_bar"
+            COST_T0 = T.cost_t0
+            MC_COST_RADIUS = torch.zeros(T.cost_weight.shape[0], dtype=torch.float64, device=dev)
+            maxtime = int(T.maxtime)
+            coltag = "centre column" if moving_bar_center_column else f"{T.info['n_cost_columns']} photo columns"
+            tag = f"moving-bar (B={T.n_batch} stimuli, {T.info['n_cost']} cost cells, {coltag})"
+        else:
+            from network.target import build_shifted_target
+            T = build_shifted_target(
+                C, share_edges=share_edges, single_shift=not multi_column, device=dev,
+                maxtime=maxtime, t_on=t_on,
+            )
+            TARGET_KIND = "tile"
+            COST_T0 = None
+            MC_COST_RADIUS = T.cost_radius
+            maxtime = int(T.signal.shape[1]) if T.signal.ndim == 3 else ml.IMPULSE_MAXTIME
+            tag = (
+                f"{'multi-column' if multi_column else 'single-column'} "
+                f"(B={T.n_batch} stimuli [{T.info['n_centers']} tiles x "
+                f"{T.info['n_shifts']} shifts], {T.info['n_cost']} cost cells)"
+            )
+
+        signal = T.signal
+        data = T.data
+        power = T.power
+        COST_WEIGHT = T.cost_weight
+        READOUT = (T.readout_batch, T.readout_unit)
+        mc_cell_index = T.readout_unit          # plotting / out_scale fallback
+    MULTI_COLUMN_SEQ = (dev == 'cpu') if sequential is None else bool(sequential)
+    MOVING_BAR_CENTER_COLUMN = bool(moving_bar_center_column) if target_norm == "moving_bar" else False
+    target_field = ",".join(target_list) if target_list is not None else str(target_norm)
+    NETWORK_TRAIN_OPTS = {
+        "network_json": str(Path(network_json).resolve()),
+        "multi_column": bool(multi_column),
+        "share_edges": bool(share_edges),
+        "target": target_field,
+        "sequential": bool(MULTI_COLUMN_SEQ),
+        "moving_bar_center_column": bool(moving_bar_center_column),
+        "target_list": list(target_list) if target_list is not None else None,
+        "loss_weights": {str(k): float(v) for k, v in (loss_weights or {}).items()} if target_list is not None else None,
+        "tile_center_column": bool(tile_center_column),
+    }
+
     seqtag = ", sequential CPU" if MULTI_COLUMN_SEQ else ""
     print(f"network: {network_json}")
-    print(f"  {tag} (B={T.n_batch} stimuli [{T.info['n_centers']} tiles x "
-          f"{T.info['n_shifts']} shifts], {T.info['n_cost']} cost cells{seqtag})")
+    print(f"  {tag}{seqtag}")
     print(f"  n_units={CONN.n_units}, n_types={nofcells}, "
-          f"nparams={schema_nparams(active_schema())}")
+          f"nparams={schema_nparams(active_schema())}, maxtime={maxtime}")
     return C
 
 def simulate_conductance(z):
@@ -662,8 +867,26 @@ def simulate_adaptive(z, inp_scalar=None, return_diag=False):
 def calc_cost(z, data, out_scale=1.0):
     # out_scale (the arg) multiplies on top of any 'out_scale' parameter declared in
     # the active schema, so legacy callers (arg) and schema-driven training both work.
+    # When multi-target packs are active, sum their costs (weights applied).
+    # The 'data' arg is ignored in that mode (kept for API compatibility).
+    if TARGET_PACKS is not None:
+        weights = TARGET_PACK_WEIGHTS or {}
+        total = 0.0
+        for name, pack in TARGET_PACKS.items():
+            w = float(weights.get(name, 1.0))
+            if w == 0.0:
+                continue
+            if MULTI_COLUMN_SEQ:
+                part = 0.0
+                for b in range(pack.signal.shape[0]):
+                    part = part + _pack_shift_cost(z, pack, b)
+            else:
+                part = _pack_cost(z, pack)
+            total = total + w * part
+        return total
+
     # When a network multi-column target is active (signal is (B, T, N)), route to
-    # the batched radial-target cost; the Borst 5-column path is untouched.
+    # the batched tile-target cost; the Borst 5-column path is untouched.
     if NETWORK is not None and signal.dim() == 3:
         if MULTI_COLUMN_SEQ:
             total = 0.0
@@ -801,6 +1024,15 @@ def do_many_runs(nofruns,nofsteps,fname,lrs=(0.1, 0.01, 0.001),outdir='FiveCol_P
     # record the model type next to the params so plotting never has to guess it
     with open(os.path.join(outdir, 'model_type.txt'), 'w') as f:
         f.write(MODEL_TYPE)
+
+    if NETWORK_TRAIN_OPTS is not None:
+        import json
+        with open(os.path.join(outdir, 'target_kind.txt'), 'w') as f:
+            f.write(str(NETWORK_TRAIN_OPTS.get('target', TARGET_KIND or 'tile')))
+        with open(os.path.join(outdir, 'network_path.txt'), 'w') as f:
+            f.write(NETWORK_TRAIN_OPTS['network_json'])
+        with open(os.path.join(outdir, 'network_train_opts.json'), 'w') as f:
+            json.dump(NETWORK_TRAIN_OPTS, f)
     
     schema   = active_schema()
     n_params = schema_nparams(schema)

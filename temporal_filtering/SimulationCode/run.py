@@ -16,6 +16,10 @@ where <id> is the SLURM job id (under SLURM) or a timestamp otherwise.
     python run.py gpu --model_type conductance --nofruns 20 --nofsteps 10000 \
                       --lrs 0.1 0.01 0.001
 
+    # moving-bar (``--network`` = folder under built_network/)
+    python run.py local --target moving_bar --network right_min_neuron1_extent2 \\
+                      --nofsteps 5 --lrs 0.1 --sequential
+
 Import-safe: importing this module does NOT parse argv or touch CUDA, so test
 scripts can `import run` and reuse run_training / save_param_tables / etc.
 """
@@ -37,6 +41,8 @@ if __name__ == "__main__":
 import numpy as np
 import torch
 
+import network_bootstrap  # noqa: F401 — connectome_io on sys.path
+from connectome_io import DEFAULT_NETWORK_RUN, NETWORK_DIR, resolve_network_json
 from FiveCol_MedSim_Pytorch import device, do_many_runs
 import FiveCol_MedSim_Pytorch as fc
 from plot_trained import plot_param_set, run_dir
@@ -123,17 +129,29 @@ def apply_param_modes(model_type, param_modes=None, param_fixes=None):
     return schema
 
 
+def resolve_network(network):
+    """Folder name under ``built_network/`` -> absolute ``network.json`` path."""
+    return str(resolve_network_json(network))
+
+
 def run_training(model_type, nofruns, nofsteps, lrs, fname=None, outdir=None,
                  no_plots=False, param_modes=None, param_fixes=None,
                  network=None, multi_column=False, share_edges=False,
-                 sequential=None):
+                 sequential=None, target="tile",
+                 target_list=None, loss_weights=None,
+                 moving_bar_center_column=False, tile_center_column=False):
     """Full training pipeline (do_many_runs + tables + plots). Returns (fname, outdir)."""
     fc.MODEL_TYPE = model_type
-    # Optional network backend (rebuilds CONN + schema + target). Must run
-    # BEFORE apply_param_modes so the mode overrides act on the network schema.
+    if target == "moving_bar" and not network and not target_list:
+        network = DEFAULT_NETWORK_RUN
     if network:
+        network = resolve_network(network)
         fc.use_network(network, multi_column=multi_column,
-                          share_edges=share_edges, sequential=sequential)
+                       share_edges=share_edges, sequential=sequential,
+                       target=target,
+                       moving_bar_center_column=moving_bar_center_column,
+                       target_list=target_list, loss_weights=loss_weights,
+                       tile_center_column=tile_center_column)
     apply_param_modes(model_type, param_modes, param_fixes)
     suffix = "" if model_type == "conductance" else f"_{model_type}"
     fname = fname or f"training{suffix or '_with_Ih'}.npy"
@@ -175,18 +193,42 @@ def parse_args():
         p.add_argument("--fix", nargs="+", default=[], metavar="NAME=VALUE",
                        help="hold a param fixed at VALUE (implies fixed mode), "
                             "e.g. --fix Ih_midv=-50 out_scale=1.0")
-        p.add_argument("--network", default=None, metavar="PATH",
-                       help="path to a network.json; enables the "
-                            "ScatterConn backend (default: Borst 5-column dense)")
-        p.add_argument("--multi_column", action="store_true",
-                       help="network multi-column training (7-shift radial target)")
+        p.add_argument("--network", default=None, metavar="RUN",
+                       help=f"built_network run folder name (under {NETWORK_DIR}), "
+                            f"e.g. {DEFAULT_NETWORK_RUN}; "
+                            f"moving_bar default if omitted")
+        p.add_argument(
+            "--target",
+            default="tile",
+            help="target name(s): 'tile' or 'moving_bar', or comma-separated "
+                 "multi-target list, e.g. moving_bar,tile",
+        )
+        p.add_argument(
+            "--loss_weight",
+            nargs="+",
+            default=[],
+            metavar="NAME=VALUE",
+            help="per-target loss weights, e.g. moving_bar=1 tile=0.5",
+        )
+        p.add_argument("--shift", action="store_true",
+                       help="tile: use 7 shifts (centre + 6 neighbours)")
         p.add_argument("--share_edges", action="store_true",
                        help="full-graph tiling: 43 edge-sharing tiles (default 31 disjoint)")
-        p.add_argument("--sequential", action="store_true", default=None,
-                       help="force CPU-sequential multi-column cost (default: auto)")
+        # CPU default behaviour is sequential automatically in FiveCol_MedSim_Pytorch.
+        # We intentionally keep the CLI surface minimal (no manual --sequential flag).
+        p.add_argument(
+            "--center_only",
+            default="",
+            help="comma-separated targets that use centre-column-only cost; "
+                 "choices: tile,moving_bar (e.g. --center_only tile,moving_bar)",
+        )
 
     add_common(sub.add_parser("local", help="short local CPU run (CUDA disabled)"), 1, 100)
     add_common(sub.add_parser("gpu", help="full training run"), 20, 10000)
+    add_common(sub.add_parser(
+        "auto",
+        help="auto pick CPU/GPU (CPU uses sequential cost by default)",
+    ), 1, 10000)
     return parser.parse_args()
 
 
@@ -205,12 +247,32 @@ def main():
     args = parse_args()
     param_modes = parse_kv(args.mode)
     param_fixes = parse_kv(args.fix, float)
+    loss_weights = parse_kv(getattr(args, "loss_weight", []) or [], float)
+    target_raw = str(args.target).strip()
+    target_list = [t.strip() for t in target_raw.split(",") if t.strip()]
+    target_single = target_list[0] if len(target_list) == 1 else "tile"
+    if target_single not in ("tile", "moving_bar"):
+        raise SystemExit(f"unknown --target {target_single!r} (expected tile|moving_bar)")
+    if len(target_list) > 1:
+        bad = [t for t in target_list if t not in ("tile", "moving_bar")]
+        if bad:
+            raise SystemExit(f"unknown target(s) in --target: {bad} (expected tile|moving_bar)")
+    center_only = [t.strip() for t in str(args.center_only).split(",") if t.strip()]
+    bad_center = [t for t in center_only if t not in ("tile", "moving_bar")]
+    if bad_center:
+        raise SystemExit(f"unknown target(s) in --center_only: {bad_center} (expected tile|moving_bar)")
+    moving_bar_center_column = "moving_bar" in center_only
+    tile_center_column = "tile" in center_only
     outdir = run_dir(args.model_type, parent=args.outdir)
     run_training(args.model_type, args.nofruns, args.nofsteps, args.lrs,
                  fname=args.fname, outdir=outdir, no_plots=args.no_plots,
                  param_modes=param_modes, param_fixes=param_fixes,
-                 network=args.network, multi_column=args.multi_column,
-                 share_edges=args.share_edges, sequential=args.sequential)
+                 network=args.network, multi_column=args.shift,
+                 share_edges=args.share_edges,
+                 target=target_single,
+                 target_list=(target_list if len(target_list) > 1 else None), loss_weights=loss_weights,
+                 moving_bar_center_column=moving_bar_center_column,
+                 tile_center_column=tile_center_column)
 
 
 if __name__ == "__main__":

@@ -12,10 +12,10 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-import connectome_path  # noqa: F401
+import network_bootstrap  # noqa: F401
 
 from column_mapper import HEX_PATCH_RADIUS
-from Medulla_Library import SIGNAL_BASELINE, SIGNAL_BRIGHT, SIGNAL_DARK, T_ON
+from Medulla_Library import SIGNAL_BASELINE, SIGNAL_BRIGHT, SIGNAL_DARK, T_ON, T_TAIL
 
 # Gruntman Fig. 1 Ci fast condition: 40 ms / 2.25 deg per LED step.
 GRUNTMAN_SPEED_DEG_S = 56.0
@@ -467,17 +467,13 @@ def _trail_to_step(
     return t
 
 
-def moving_bar_maxtime(
+def moving_bar_sweep_end_step(
     specs: Sequence[MovingBarSpec],
     field_deg: Tuple[float, float, float, float],
     t_on: int = T_ON,
     deltat_ms: float = 10.0,
 ) -> int:
-    """Simulation length: ``t_on`` (0.5 s baseline) + steps to sweep the field.
-
-    Returns the exclusive upper time index (``range(maxtime)``), simulating
-    through the step where the bar trail reaches the field-exit position.
-    """
+    """Exclusive step index where the bar finishes sweeping the field (no tail)."""
     x0, y0, x1, y1 = field_deg
     if not specs:
         return t_on + 1
@@ -490,6 +486,22 @@ def moving_bar_maxtime(
             _trail_to_step(spec, trail_start, trail_exit, t_on, deltat_ms),
         )
     return t_exit + 1
+
+
+def moving_bar_maxtime(
+    specs: Sequence[MovingBarSpec],
+    field_deg: Tuple[float, float, float, float],
+    t_on: int = T_ON,
+    deltat_ms: float = 10.0,
+    t_tail: int = T_TAIL,
+) -> int:
+    """Simulation length: ``t_on`` (0.5 s) + sweep + ``t_tail`` (0.5 s post-stimulus).
+
+    Returns the exclusive upper time index (``range(maxtime)``). Stimulus current
+    is baseline before ``t_on`` and after the sweep; the tail holds baseline while
+    the network settles for per-column ``t_center ± 0.45 s`` training windows.
+    """
+    return moving_bar_sweep_end_step(specs, field_deg, t_on=t_on, deltat_ms=deltat_ms) + t_tail
 
 
 def moving_bar_transit_times(
@@ -507,6 +519,47 @@ def moving_bar_transit_times(
         _trail_to_step(spec, trail_start, _trail_center_target(spec, x0, y0, x1, y1), t_on, deltat_ms, maxtime),
         _trail_to_step(spec, trail_start, _trail_exit(spec, x0, y0, x1, y1), t_on, deltat_ms, maxtime),
     )
+
+
+def _trail_target_for_column_center(
+    col_x: float,
+    col_y: float,
+    spec: MovingBarSpec,
+) -> float:
+    """Trail position when the bar centre sits at ``col_x`` / ``col_y`` on the motion axis."""
+    w = float(spec.width_deg)
+    d = spec.direction
+    if d == "right":
+        return float(col_x) - 0.5 * w
+    if d == "left":
+        return float(col_x) + 0.5 * w
+    if d == "up":
+        return float(col_y) - 0.5 * w
+    if d == "down":
+        return float(col_y) + 0.5 * w
+    raise ValueError(f"unknown direction {d!r}")
+
+
+def column_bar_center_step(
+    col_x: float,
+    col_y: float,
+    spec: MovingBarSpec,
+    field_deg: Tuple[float, float, float, float],
+    t_on: int = T_ON,
+    deltat_ms: float = 10.0,
+    maxtime: Optional[int] = None,
+) -> int:
+    """Simulation step when the bar centre crosses a column on the motion axis.
+
+    Horizontal motion (``right`` / ``left``) uses ``col_x`` only; vertical motion
+    (``up`` / ``down``) uses ``col_y`` only. The bar spans the full field extent
+    perpendicular to motion (see ``_bar_rect``), so all columns sharing the same
+    motion-axis coordinate share the same ``t_center``.
+    """
+    x0, y0, x1, y1 = field_deg
+    trail_start = _trail_start(spec, x0, y0, x1, y1)
+    trail_target = _trail_target_for_column_center(col_x, col_y, spec)
+    return _trail_to_step(spec, trail_start, trail_target, t_on, deltat_ms, maxtime)
 
 
 def bar_trail_at_step(

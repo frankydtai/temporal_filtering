@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Hex radial training target for connectome multi-column training.
+"""Hex tile training target for connectome multi-column training.
 
 For every (tile, shift) stimulus the connectome is driven at ONE column; each
 fit-cell readout is compared to ``RecF(r) * ImpR(t)`` where ``r`` is the
@@ -12,7 +12,7 @@ r=sqrt(3) edge target is evaluated at its true radius rather than snapped to
 col +/-2 (which would mis-sign L1's centre-surround near its ~1.6 col zero
 crossing).
 
-Each radial ring is weighted by 1/(columns in that ring) so the 4 radii
+Each tile ring is weighted by 1/(columns in that ring) so the 4 radii
 (0,1,sqrt3,2) contribute equally and the low-SNR outer surround can't dominate.
 
 ``build_shifted_target`` returns everything the simulator needs:
@@ -40,6 +40,8 @@ from .tiling import (
     euclid_hex_dist,
     unit_type_names,
 )
+
+CENTER_COLUMN_UV = (0, 0)
 
 # RF sample index of the receptive-field centre, and samples per column step
 # (data[i,j] = RecF_data[i, 5j+2]; j=4 -> sample 22 -> r=0).
@@ -80,12 +82,15 @@ def build_shifted_target(
     signal_bright: float = SIGNAL_BRIGHT,
     data_amp: float = DATA_AMP,
     device: Optional[str] = None,
+    center_column: bool = False,
 ) -> ShiftedTarget:
     device = device or C.device
     recf_data, impr_data = read_RecF_ImpR()  # (13,45), (13,IMPULSE_MAXTIME)
     fit_row = {ft: i for i, ft in enumerate(FIT_CELL_TYPES)}
 
-    tiling = build_tiling(C, tile_extent, share_edges, single_tile)
+    tiling = build_tiling(
+        C, tile_extent, share_edges, single_tile, center_column=center_column,
+    )
     if single_shift:
         tiling.shifts = [(0, 0)]
     names = unit_type_names(C)
@@ -110,7 +115,7 @@ def build_shifted_target(
     Tp = maxtime - t_on
 
     # Per (batch, radius) ring size counted in COLUMNS (not cells), so every
-    # radial ring gets weight 1/columns -> the 4 radii contribute equally.
+    # tile ring gets weight 1/columns -> the 4 radii contribute equally.
     col_count = {}
     for b, (su, sv, center) in enumerate(batches):
         for du, dv in tiling.members:
@@ -153,6 +158,8 @@ def build_shifted_target(
         "n_cost": data.shape[0],
         "n_centers": len(tiling.centers),
         "n_shifts": len(tiling.shifts),
+        "center_column": bool(center_column),
+        "cost_column_uv": CENTER_COLUMN_UV if center_column else None,
         "present_fit": present_fit,
         "share_edges": share_edges,
     }

@@ -31,7 +31,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 os.chdir(ROOT)
 
-import network_io  # noqa: F401
+import network_bootstrap  # noqa: F401
 import FiveCol_MedSim_Pytorch as fc
 from plot_trained import (
     _moving_bar_center_only,
@@ -42,7 +42,7 @@ from plot_trained import (
     resolve_model_type,
     restore_fc_context,
 )
-from training_io import COST_HALF_WINDOW_STEPS, COST_WINDOW_STEPS
+from training_config import COST_HALF_WINDOW_STEPS, COST_WINDOW_STEPS
 from t4_t5_preference import READOUT_SUBTYPES, fig1_key_for_stimulus, normalize_side
 from visual_stimulus.moving_bar_stimulus import (
     column_bar_center_step,

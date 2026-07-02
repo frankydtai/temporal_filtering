@@ -21,6 +21,7 @@ DATA_DIR = Path(__file__).resolve().parent
 RAW_DIR = DATA_DIR / "download"
 # Per-run network folders (<side>_min_neuron<N>/ etc.) live under here.
 NETWORK_DIR = DATA_DIR / "built_network"
+DEFAULT_NETWORK_RUN = "right_min_neuron1_extent2"
 # Column map artifacts (per-side column tables + the column_map.png) live here.
 COLUMN_HEX_DIR = DATA_DIR / "column_hex"
 # Located-column CSVs (r1_6_<side>_post.csv etc., from column_locator.py) live here.

@@ -6,9 +6,9 @@ Geometry/timing from ``moving_bar_stimulus``; unit currents from ``network.stimu
 
 Usage (from SimulationCode/, uses project .venv):
 
-    ../.venv/bin/python visual_stimulus/plot_moving_bar.py
-    ../.venv/bin/python visual_stimulus/plot_moving_bar.py --gif
-    ../.venv/bin/python visual_stimulus/plot_moving_bar.py --network right_min_neuron1_extent2 --direction down --gif
+    ../.venv/bin/python visual_stimulus/plot_moving_bar_stimulus.py
+    ../.venv/bin/python visual_stimulus/plot_moving_bar_stimulus.py --gif
+    ../.venv/bin/python visual_stimulus/plot_moving_bar_stimulus.py --network right_min_neuron1_extent2 --direction down --gif
 """
 from __future__ import annotations
 

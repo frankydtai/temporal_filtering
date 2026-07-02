@@ -3,7 +3,7 @@
 
 Usage:
     ../.venv/bin/python test/run_moving_bar_probe.py
-    ../.venv/bin/python test/run_moving_bar_probe.py --network path/to/network.json
+    ../.venv/bin/python test/run_moving_bar_probe.py --network right_min_neuron1_extent2
 """
 from __future__ import annotations
 
@@ -17,20 +17,19 @@ sys.path.insert(0, ROOT)
 os.chdir(ROOT)
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
+import network_bootstrap  # noqa: F401
 import FiveCol_MedSim_Pytorch as fc
+from connectome_io import DEFAULT_NETWORK_RUN, resolve_network_json
 from network.stimulus import build_moving_bar_signals
-from connectome_io import NETWORK_DIR
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument(
-        "--network",
-        default=str(NETWORK_DIR / "right_min_neuron1_extent2" / "network.json"),
-    )
+    ap.add_argument("--network", default=DEFAULT_NETWORK_RUN,
+                    help="built_network run folder name")
     args = ap.parse_args()
 
-    fc.use_network(args.network, multi_column=False, sequential=True, dev="cpu")
+    fc.use_network(str(resolve_network_json(args.network)), multi_column=False, sequential=True, dev="cpu")
     T = build_moving_bar_signals(fc.NETWORK, t_on=fc.t_on, device="cpu")
     fc.signal = T.signal
     maxtime = int(T.info["maxtime"])

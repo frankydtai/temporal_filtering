@@ -16,3 +16,4 @@ FAFB_DIR = Path(__file__).resolve().parent.parent / "Connectome" / "FAFBv783"
 
 if str(FAFB_DIR) not in sys.path:
     sys.path.insert(0, str(FAFB_DIR))
+
